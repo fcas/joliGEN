@@ -28,7 +28,7 @@ lpips
 pytest
 pytest-asyncio
 httpx
-black==24.2.0
+black==24.3.0
 dists-pytorch
 transformers
 diffusers==0.25.1
