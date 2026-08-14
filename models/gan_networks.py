@@ -44,7 +44,8 @@ from .modules.unet_generator_attn.unet_generator_attn import (
 
 from .modules.hdit.hdit import HDiT, HDiTConfig
 
-from .modules.img2img_turbo.img2img_turbo import Img2ImgTurbo
+# from .modules.img2img_turbo.img2img_turbo import Img2ImgTurbo
+from .modules.hat.hat import HAT
 
 
 def define_G(
@@ -78,7 +79,6 @@ def define_G(
     train_feat_wavelet,
     G_lora_unet,
     G_lora_vae,
-    G_prompt,
     **unused_options,
 ):
     """Create a generator
@@ -251,8 +251,8 @@ def define_G(
         net = HDiT(
             levels=hdit_config.levels,
             mapping=hdit_config.mapping,
-            in_channels=model_input_nc,
-            out_channels=model_output_nc,
+            in_channel=model_input_nc,
+            out_channel=model_output_nc,
             patch_size=hdit_config.patch_size,
             last_zero_init=False,
             num_classes=0,
@@ -261,17 +261,24 @@ def define_G(
         cond_embed_dim = hdit_config.mapping.width
         net.cond_embed_dim = cond_embed_dim
         return net
-    elif G_netG == "img2img_turbo":
-        ##TODO: add img2img_turbo
-        net = Img2ImgTurbo(
-            ##TODO
-            in_channels=model_input_nc,
-            out_channels=model_output_nc,
-            lora_rank_unet=G_lora_unet,
-            lora_rank_vae=G_lora_vae,
-            prompt=G_prompt,
+    elif G_netG == "hat":
+        net = HAT(
+            img_size=data_crop_size,
+            patch_size=1,  # 2,  # 1 for 64
+            window_size=16,  # ,6, # 7
+            in_chans=model_input_nc,
+            out_chans=model_output_nc,
+            upsampler="pixelshuffle",
         )
         return net
+    #   elif G_netG == "img2img_turbo":
+    #       net = Img2ImgTurbo(
+    #           in_channel=model_input_nc,
+    #           out_channel=model_output_nc,
+    #           lora_rank_unet=G_lora_unet,
+    #           lora_rank_vae=G_lora_vae,
+    #       )
+    #       return net
     else:
         raise NotImplementedError(
             "Generator model name [%s] is not recognized" % G_netG
@@ -281,7 +288,7 @@ def define_G(
 
 def define_D(
     D_netDs,
-    model_input_nc,
+    model_output_nc,
     D_ndf,
     D_n_layers,
     D_norm,
@@ -348,7 +355,7 @@ def define_D(
     for netD in D_netDs:
         if netD == "basic":  # default PatchGAN classifier
             net = NLayerDiscriminator(
-                model_input_nc,
+                model_output_nc,
                 D_ndf,
                 n_layers=3,
                 norm_layer=norm_layer,
@@ -360,7 +367,7 @@ def define_D(
 
         elif netD == "n_layers":  # more options
             net = NLayerDiscriminator(
-                model_input_nc,
+                model_output_nc,
                 D_ndf,
                 D_n_layers,
                 norm_layer=norm_layer,
@@ -370,14 +377,14 @@ def define_D(
             return_nets[netD] = init_net(net, model_init_type, model_init_gain)
 
         elif netD == "pixel":  # classify if each pixel is real or fake
-            net = PixelDiscriminator(model_input_nc, D_ndf, norm_layer=norm_layer)
+            net = PixelDiscriminator(model_output_nc, D_ndf, norm_layer=norm_layer)
             return_nets[netD] = init_net(net, model_init_type, model_init_gain)
 
         elif netD in TORCH_MODEL_CLASSES:  # load torchvision model
             nclasses = 1
             template = netD
             net = torch_model(
-                model_input_nc,
+                model_output_nc,
                 D_ndf,
                 nclasses,
                 data_crop_size + margin,

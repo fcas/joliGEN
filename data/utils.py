@@ -1,22 +1,35 @@
 from PIL import Image
 
 
-def load_image(img_path):
-    image = Image.open(img_path)
+def load_image(img_path, img_bits=8, use_tiff=False):
+    if use_tiff:
+        import tifffile
 
-    # Define the color for transparency (e.g., transparent black)
-    transparent_black = (0, 0, 0, 0)
+        img = tifffile.imread(img_path)
+        return img
 
-    # Convert the image to RGBA mode if needed
-    image = image.convert("RGBA")
+    with Image.open(img_path) as img:
+        if img_bits == 8:
+            return img.convert("RGB")
+        return img.copy()
 
-    # Create a new image with the specified color for transparency
-    transparent_color = Image.new("RGBA", image.size, transparent_black)
 
-    # Use alpha_composite to make the specified color transparent
-    result = Image.alpha_composite(transparent_color, image)
+# def load_image(img_path):
+#     image = Image.open(img_path)
 
-    # Convert the result back to RGB mode
-    result_rgb = result.convert("RGB")
+#     # Define the color for transparency (e.g., transparent black)
+#     transparent_black = (0, 0, 0, 0)
 
-    return result_rgb
+#     # Convert the image to RGBA mode if needed
+#     image = image.convert("RGBA")
+
+#     # Create a new image with the specified color for transparency
+#     transparent_color = Image.new("RGBA", image.size, transparent_black)
+
+#     # Use alpha_composite to make the specified color transparent
+#     result = Image.alpha_composite(transparent_color, image)
+
+#     # Convert the result back to RGB mode
+#     result_rgb = result.convert("RGB")
+
+#     return result_rgb

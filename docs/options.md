@@ -9,7 +9,7 @@ Here are all the available options to call with `train.py`
 | --dataroot | string | None | path to images (should have subfolders trainA, trainB, valA, valB, etc) |
 | --ddp_port | string | 12355 |  |
 | --gpu_ids | string | 0 | gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU |
-| --model_type | string | cut | chooses which model to use.<br/><br/> **Values:** cut, cycle_gan, palette, cm |
+| --model_type | string | cut | chooses which model to use.<br/><br/> **Values:** cut, cycle_gan, palette, cm, cm_gan, sc, b2b, mat |
 | --name | string | experiment_name | name of the experiment. It decides where to store samples and models |
 | --phase | string | train | train, val, test, etc |
 | --suffix | string |  | customized suffix: opt.name = opt.name + suffix: e.g., {model}_{netG}_size{load_size} |
@@ -57,11 +57,10 @@ Here are all the available options to call with `train.py`
 | --G_lora_vae | int | 8 | lora vae rank for G |
 | --G_nblocks | int | 9 | \# of layer blocks in G, applicable to resnets |
 | --G_netE | string | resnet_256 | specify multimodal latent vector encoder<br/><br/> **Values:** resnet_128, resnet_256, resnet_512, conv_128, conv_256, conv_512 |
-| --G_netG | string | mobile_resnet_attn | specify generator architecture<br/><br/> **Values:** resnet, resnet_attn, mobile_resnet, mobile_resnet_attn, unet_256, unet_128, segformer_attn_conv, segformer_conv, ittr, unet_mha, uvit, unet_mha_ref_attn, dit, hdit, img2img_turbo |
+| --G_netG | string | mobile_resnet_attn | specify generator architecture<br/><br/> **Values:** resnet, resnet_attn, mobile_resnet, mobile_resnet_attn, unet_256, unet_128, segformer_attn_conv, segformer_conv, ittr, unet_mha, uvit, unet_mha_ref_attn, dit, hdit, img2img_turbo, unet_vid, vit_vid, hat, vit |
 | --G_ngf | int | 64 | \# of gen filters in the last conv layer |
 | --G_norm | string | instance | instance normalization or batch normalization for G<br/><br/> **Values:** instance, batch, none |
 | --G_padding_type | string | reflect | whether to use padding in the generator<br/><br/> **Values:** reflect, replicate, zeros |
-| --G_prompt | string |  | Text prompt for G |
 | --G_spectral | flag |  | whether to use spectral norm in the generator |
 | --G_unet_mha_attn_res | array | [16] | downrate samples at which attention takes place |
 | --G_unet_mha_channel_mults | array | [1, 2, 4, 8] | channel multiplier for each level of the UNET mha |
@@ -71,13 +70,73 @@ Here are all the available options to call with `train.py`
 | --G_unet_mha_num_heads | int | 1 | number of heads in the mha architecture |
 | --G_unet_mha_res_blocks | array | [2, 2, 2, 2] | distribution of resnet blocks across the UNet stages, should have same size as --G_unet_mha_channel_mults |
 | --G_unet_mha_vit_efficient | flag |  | if true, use efficient attention in UNet and UViT |
+| --G_unet_vid_max_sequence_length | int | 25 | max frame number(sequence length) for unet_vid in the PositionalEncoding |
+| --G_unet_vid_num_attention_heads | int | 8 | number of attention heads for unet_vid motion module, 8, 4, ... |
+| --G_unet_vid_num_transformer_blocks | int | 2 | number of unet_vid motion module transformer blocks, 2, 1, ... |
 | --G_uvit_num_transformer_blocks | int | 6 | Number of transformer blocks in UViT |
+| --G_vit_disable_bottleneck | flag |  | Disable JiT bottleneck by forcing bottleneck_dim=hidden_size for vit/vit_vid. |
+| --G_vit_num_classes | int | 1 | number of class labels used by vit/vit_vid class embeddings |
+| --G_vit_num_register_tokens | int | 0 | number of learned register prefix tokens used by vit/vit_vid; 0 disables them |
+| --G_vit_variant | string | JiT-B/16 | Selects the ViT backbone when --G_netG vit (use JiT-\*) or vit_vid (use JiTVid-\*) |
+| --G_vit_vid_motion_every | int | 0 | JiTViD temporal motion insertion interval. 0 keeps the default last-layer-only motion module; 1 inserts after every ViT block; 2 inserts after every two blocks. |
 
 ## Algorithm-specific
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
+| --alg_b2b_P_mean | float | -0.8 | Mean of the logistic-normal timestep distribution used at B2B training time. |
+| --alg_b2b_P_std | float | 0.8 | Std of the logistic-normal timestep distribution used at B2B training time. |
+| --alg_b2b_apply_predicted_mask | flag |  | At inference only, composite generated pixels with the predicted mask instead of the coarse input mask. Disabled by default. |
+| --alg_b2b_autoregressive | flag |  | Autoregressive training: each batch is with one GT and the other is noisy image  |
+| --alg_b2b_cfg_scale | float | 1.0 | Classifier-free guidance scale used at B2B inference time. |
+| --alg_b2b_clip_denoised | flag |  | Clip B2B denoised states to [-1, 1] during sampling (disabled by default to match JiT). |
+| --alg_b2b_denoise_timesteps | array | [50] | One or more denoising step counts to evaluate at inference (positive integers) |
+| --alg_b2b_disable_inference_clipping | flag |  | Disable inference-time denominator clipping in v=(x_pred-x)/(1-t), i.e. use raw (1-t) at sampling. |
+| --alg_b2b_dists_mean | array | [0.485, 0.456, 0.406] | Mean normalization for DISTS |
+| --alg_b2b_dists_std | array | [0.229, 0.224, 0.225] | Std normalization for DISTS |
+| --alg_b2b_force_class_token | int | -1 | Force every B2B sample to use this ViT class-token label. Use -1 to keep dataset/object-label behavior. |
+| --alg_b2b_global_context_conditioning | flag |  | Condition JiTViD B2B denoisers on masked full-frame context encoded by a small CNN. Deprecated compatibility alias for --alg_b2b_global_context_mode adaln. |
+| --alg_b2b_global_context_mode | string | none | Global context conditioning mode for JiTViD B2B. 'adaln' uses the legacy small-CNN AdaLN path, 'tokens' inserts global context ViT prefix tokens, and 'both' enables both paths.<br/><br/> **Values:** none, adaln, tokens, both |
+| --alg_b2b_global_context_size | int | 128 | Square input size for the masked full-frame B2B context encoder. |
+| --alg_b2b_lambda_mask | float | 0.01 | Weight of the joint instance-mask prediction loss. |
+| --alg_b2b_lambda_perceptual | float | 1.0 | Weight for perceptual loss |
+| --alg_b2b_lambda_ref_copy | float | 0.0 | Weight for an image-space copy loss on autoregressive B2B reference frames before mask projection. 0 disables it. |
+| --alg_b2b_lora | flag |  | Train B2B JiT/JiTViD with PEFT LoRA adapters while saving merged full checkpoints. |
+| --alg_b2b_lora_alpha | int | 16 | LoRA alpha scaling for B2B JiT/JiTViD finetuning. |
+| --alg_b2b_lora_dropout | float | 0.05 | LoRA dropout for B2B JiT/JiTViD finetuning. |
+| --alg_b2b_lora_rank | int | 8 | LoRA rank for B2B JiT/JiTViD finetuning. |
+| --alg_b2b_lora_target_modules | array | ['attn.qkv', 'attn.proj', 'mlp.w12', 'mlp.w3'] | Module suffixes targeted by B2B LoRA. Defaults to attention and MLP projections in JiT/JiTViD blocks. |
+| --alg_b2b_loss | string | MSE | Loss type for B2B denoising<br/><br/> **Values:** L1, MSE, pseudo_huber, multiscale_L1, multiscale_MSE |
+| --alg_b2b_loss_masked_region_only | flag |  | Normalize B2B loss over masked pixels only (instead of all image pixels). |
+| --alg_b2b_mask_as_channel | flag |  | Concatenate the inpainting mask as an additional input channel in B2B. |
+| --alg_b2b_mask_bce_weight | float | 1.0 | BCE contribution to the B2B mask prediction loss. |
+| --alg_b2b_mask_dice_weight | float | 1.0 | Dice contribution to the B2B mask prediction loss. |
+| --alg_b2b_mask_prediction | flag |  | Jointly predict the target instance mask during B2B inpainting. |
+| --alg_b2b_mask_prediction_dilation | int | 3 | Predicted-mask dilation radius in model pixels. |
+| --alg_b2b_mask_prediction_threshold | float | 0.5 | Probability threshold for the final predicted inpainting mask. |
+| --alg_b2b_mask_size_conditioning | flag |  | Condition JiT/JiTViD B2B denoisers on normalized mask bbox geometry (center, size, area, aspect). |
+| --alg_b2b_metric_mask | flag |  | Evaluate metrics only on dilated mask region |
+| --alg_b2b_minsnr | flag |  | use min-SNR weighting |
+| --alg_b2b_multi_dataset_class_conditioning | flag |  | Use multi_dataset dataset_index as the ViT class-token conditioning label instead of object class labels. |
+| --alg_b2b_noise_scale | float | -1.0 | Noise scale for B2B. Use \<=0 for automatic JiT-like defaults (1.0 at \<=256px, else 2.0). |
+| --alg_b2b_object_ref_paths | array | [] | Static object reference image paths. Providing one or more paths enables object-reference token conditioning for vit_vid B2B. |
+| --alg_b2b_object_ref_size | int | 64 | Square padded input size for object-reference token conditioning. Must be divisible by the ViT patch size. |
+| --alg_b2b_perceptual_loss | array | [''] | Optional perceptual losses<br/><br/> **Values:** , LPIPS, DISTS |
+| --alg_b2b_ref_degrade_noise_std | float | 0.05 | Gaussian noise std for degraded autoregressive reference frames. |
+| --alg_b2b_ref_degrade_prob | float | 0.0 | Probability of adding Gaussian noise to selected autoregressive reference frames in the model input. |
+| --alg_b2b_reference_mask_precision_probs | array | [0.5, 0.5] | Sampling probabilities for exact and dilated masks on the teacher-forced autoregressive reference frame. |
+| --alg_b2b_t_eps | float | 0.05 | Minimum clamp value for (1-t) in velocity conversion v=(x_pred-x)/(1-t). |
+| --alg_b2b_temporal_frame_step_conditioning | flag |  | Condition JiTViD B2B denoisers on the raw temporal frame stride used to build each video sample. |
+| --alg_b2b_timestep_uniform_mix_prob | float | 0.1 | Probability of replacing a logistic-normal B2B training timestep with a uniform sample in [0, 1]. |
+| --alg_b2b_use_gt_prob | float | 0.1 | Probability of selecting a sample to use a GT frame in autoregressive B2B training. |
+| --alg_b2b_use_predicted_mask_during_denoising | flag |  | At inference only, feed each completed denoising interval's predicted mask into the following interval. Disabled by default. |
+| --alg_cm_dists_mean | array | [0.485, 0.456, 0.406] | mean for DISTS perceptual loss |
+| --alg_cm_dists_std | array | [0.229, 0.224, 0.225] | std for DISTS perceptual loss |
+| --alg_cm_lambda_perceptual | float | 1.0 | weight for LPIPS and DISTS perceptual losses |
+| --alg_cm_metric_mask | flag |  | Evaluate the metric PSNR and SSIM on the dilated mask region instead of the cropped image. |
 | --alg_cm_num_steps | int | 1000000 | number of steps before reaching the fully discretized consistency model sampling schedule |
+| --alg_cm_perceptual_loss | array | [''] | optional supervised perceptual loss<br/><br/> **Values:** , LPIPS, DISTS |
+| --alg_ddpm_ft_mode | string | cm | Fine-tuning mode for pretrained DDPM: 'cm' (consistency model) or 'ect' (easy consistency tuning).<br/><br/> **Values:** cm, ect |
 | --alg_diffusion_cond_computed_sketch_list | array | ['canny', 'hed'] | what primitives to use for random sketch |
 | --alg_diffusion_cond_embed | string |  | whether to use conditioning embeddings to the generator layers, and what type<br/><br/> **Values:** , mask, class, mask_and_class, ref |
 | --alg_diffusion_cond_embed_dim | int | 32 | nb of examples processed for inference |
@@ -95,12 +154,21 @@ Here are all the available options to call with `train.py`
 | --alg_diffusion_cond_sam_sobel_threshold | float | 0.7 | sobel threshold in %% of gradient magnitude |
 | --alg_diffusion_cond_sam_use_gaussian_filter | flag |  | whether to apply a Gaussian blur to each SAM masks |
 | --alg_diffusion_cond_sketch_canny_range | array | [0, 765] | range of randomized canny sketch thresholds |
+| --alg_diffusion_ddpm_cm_ft | flag |  | whether to apply consistency model finetuning from pretrained DDPM |
 | --alg_diffusion_dropout_prob | float | 0.0 | dropout probability for classifier-free guidance |
 | --alg_diffusion_generate_per_class | flag |  | whether to generate samples of each images |
 | --alg_diffusion_lambda_G | float | 1.0 | weight for supervised loss |
 | --alg_diffusion_ref_embed_net | string | clip | embedding network to use for ref conditioning<br/><br/> **Values:** clip, imagebind |
 | --alg_diffusion_super_resolution_scale | float | 2.0 | scale for super resolution |
 | --alg_diffusion_task | string | inpainting | Whether to perform inpainting, super resolution or pix2pix<br/><br/> **Values:** inpainting, super_resolution, pix2pix |
+| --alg_diffusion_vid_canny_dropout | array | [[]] | the range of probabilities for dropping the canny for each frame |
+| --alg_sc_denoise_timesteps | array | [16] | number of denoise steps |
+| --alg_sc_dists_mean | array | [0.485, 0.456, 0.406] | mean for DISTS perceptual loss |
+| --alg_sc_dists_std | array | [0.229, 0.224, 0.225] | std for DISTS perceptual loss |
+| --alg_sc_lambda_perceptual | float | 1.0 | weight for LPIPS and DISTS perceptual losses |
+| --alg_sc_metric_mask | flag |  | Evaluate the metric PSNR and SSIM on the dilated mask region instead of the cropped image. |
+| --alg_sc_num_steps | int | 1000000 | number of steps before reaching the fully discretized consistency model sampling schedule |
+| --alg_sc_perceptual_loss | array | [''] | optional supervised perceptual loss<br/><br/> **Values:** , LPIPS, DISTS |
 
 ### GAN model
 
@@ -115,10 +183,13 @@ Here are all the available options to call with `train.py`
 | --alg_cut_HDCE_gamma | float | 1.0 |  |
 | --alg_cut_HDCE_gamma_min | float | 1.0 |  |
 | --alg_cut_MSE_idt | flag |  | use MSENCE loss for identity mapping: MSE(G(Y), Y)) |
+| --alg_cut_dists_mean | array | [0.485, 0.456, 0.406] | mean for DISTS perceptual loss |
+| --alg_cut_dists_std | array | [0.229, 0.224, 0.225] | std for DISTS perceptual loss |
 | --alg_cut_flip_equivariance | flag |  | Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT |
 | --alg_cut_lambda_MSE_idt | float | 1.0 | weight for MSE identity loss: MSE(G(X), X) |
 | --alg_cut_lambda_NCE | float | 1.0 | weight for NCE loss: NCE(G(X), X) |
 | --alg_cut_lambda_SRC | float | 0.0 | weight for SRC (semantic relation consistency) loss: NCE(G(X), X) |
+| --alg_cut_lambda_perceptual | float | 1.0 | weight for LPIPS and DISTS perceptual losses |
 | --alg_cut_lambda_supervised | float | 1.0 | weight for supervised loss |
 | --alg_cut_nce_T | float | 0.07 | temperature for NCE loss |
 | --alg_cut_nce_idt | flag |  | use NCE loss for identity mapping: NCE(G(Y), Y)) |
@@ -141,6 +212,29 @@ Here are all the available options to call with `train.py`
 | --alg_cyclegan_lambda_identity | float | 0.5 | use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1 |
 | --alg_cyclegan_rec_noise | float | 0.0 | whether to add noise to reconstruction |
 
+### MAT model
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| --alg_mat_d_reg_every | int | 16 | interval for lazy discriminator R1 regularization, 0 disables it |
+| --alg_mat_ema_kimg | float | 10.0 | EMA half-life in kimg for the MAT generator |
+| --alg_mat_ema_rampup | float | 0.0 | EMA ramp-up factor, 0 disables ramp-up |
+| --alg_mat_mask_class_conditioning | flag |  | add a raw class-valued mask channel as extra MAT generator conditioning |
+| --alg_mat_motion | flag |  | enable MAT motion conditioning on self_supervised_vid_mask_online windows |
+| --alg_mat_motion_max_frames | int | 8 | maximum temporal window supported by the MAT motion module |
+| --alg_mat_motion_num_attention_heads | int | 8 | number of attention heads used by the MAT motion module |
+| --alg_mat_motion_num_transformer_blocks | int | 2 | number of temporal transformer blocks used by the MAT motion module |
+| --alg_mat_motion_prob_use_previous_frames | float | 1.0 | probability to keep previous-frame motion conditioning during training; with complementary probability, previous frames are replaced by the current masked frame to train no-conditioning behavior |
+| --alg_mat_noise_mode_eval | string | const | noise mode used by MAT during evaluation<br/><br/> **Values:** random, const, none |
+| --alg_mat_noise_mode_train | string | random | noise mode used by MAT during training<br/><br/> **Values:** random, const, none |
+| --alg_mat_pcp_ratio | float | 0.1 | weight for the MAT perceptual loss |
+| --alg_mat_r1_gamma | float | 10.0 | R1 regularization weight for the MAT discriminator |
+| --alg_mat_style_mixing_prob | float | 0.5 | style mixing probability for MAT generator training |
+| --alg_mat_transformer_lr | float | -1.0 | optional learning rate override for MAT transformer parameters |
+| --alg_mat_truncation_psi | float | 0.5 | truncation psi used for MAT evaluation and validation inference |
+| --alg_mat_w_dim | int | 512 | latent w dimensionality for MAT |
+| --alg_mat_z_dim | int | 512 | latent z dimensionality for MAT |
+
 ### ReCUT / ReCycleGAN
 
 | Parameter | Type | Default | Description |
@@ -156,23 +250,29 @@ Here are all the available options to call with `train.py`
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
+| --alg_palette_autoregressive | flag |  | Autoregressive training: each batch is either all canny edges(noisy image) or one full image with others black. |
 | --alg_palette_ddim_eta | float | 0.5 | eta for ddim sampling variance |
 | --alg_palette_ddim_num_steps | int | 10 | number of steps for ddim sampling |
 | --alg_palette_loss | string | MSE | loss type of the denoising model<br/><br/> **Values:** L1, MSE, multiscale_L1, multiscale_MSE |
+| --alg_palette_metric_mask | flag |  | Evaluate the metric PSNR and SSIM on the dilated mask region instead of the cropped image. |
 | --alg_palette_minsnr | flag |  | use min-SNR weighting |
 | --alg_palette_sampling_method | string | ddpm | choose the sampling method between ddpm and ddim<br/><br/> **Values:** ddpm, ddim |
+| --alg_palette_sampling_method_test | string | ddpm | Sampling method to use during the test phase in training. Equivalent to 'sampling_method' in inference. |
+| --alg_palette_sampling_steps_test | int | -1 | Number of sampling steps to use during the test phase in training. This functions the same as 'sampling_steps' used for DDIM inference. |
 
 ## Datasets
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | --data_crop_size | int | 256 | then crop to this size |
-| --data_dataset_mode | string | unaligned | chooses how datasets are loaded.<br/><br/> **Values:** unaligned, unaligned_labeled_cls, unaligned_labeled_mask, self_supervised_labeled_mask, unaligned_labeled_mask_cls, self_supervised_labeled_mask_cls, unaligned_labeled_mask_online, self_supervised_labeled_mask_online, unaligned_labeled_mask_cls_online, self_supervised_labeled_mask_cls_online, aligned, nuplet_unaligned_labeled_mask, temporal_labeled_mask_online, self_supervised_temporal, single, unaligned_labeled_mask_ref, self_supervised_labeled_mask_ref, unaligned_labeled_mask_online_ref, self_supervised_labeled_mask_online_ref |
+| --data_dataset_mode | string | unaligned | chooses how datasets are loaded.<br/><br/> **Values:** unaligned, unaligned_labeled_cls, unaligned_labeled_mask, self_supervised_labeled_mask, unaligned_labeled_mask_cls, self_supervised_labeled_mask_cls, unaligned_labeled_mask_online, self_supervised_labeled_mask_online, unaligned_labeled_mask_cls_online, self_supervised_labeled_mask_cls_online, aligned, nuplet_unaligned_labeled_mask, temporal_labeled_mask_online, self_supervised_vid_mask_online, multi_dataset, self_supervised_vid_labeled_mask_cls_online, self_supervised_temporal, single, unaligned_labeled_mask_ref, self_supervised_labeled_mask_ref, unaligned_labeled_mask_online_ref, unaligned_labeled_mask_online_prompt, self_supervised_labeled_mask_online_ref |
 | --data_direction | string | AtoB | AtoB or BtoA<br/><br/> **Values:** AtoB, BtoA |
 | --data_image_bits | int | 8 | number of bits of the image (e.g. 8, 12 or 16) |
 | --data_inverted_mask | flag |  | whether to invert the mask, i.e. around the bbox |
 | --data_load_size | int | 286 | scale images to this size |
 | --data_max_dataset_size | int | 1000000000 | Maximum number of samples allowed per dataset. If the dataset directory contains more than max_dataset_size, only a subset is loaded. |
+| --data_multi_dataset_config | string |  | path to a JSON config describing child datasets for data_dataset_mode=multi_dataset |
+| --data_multi_dataset_crop_delta_scale | float | 1.0 | scale per-child data_online_creation_crop_delta_A overrides in multi_dataset mode |
 | --data_num_threads | int | 4 | \# threads for loading data |
 | --data_online_context_pixels | int | 0 | context pixel band around the crop, unused for generation, only for disc  |
 | --data_online_fixed_mask_size | int | -1 | if \>0, it will be used as fixed bbox size (warning: in dataset resolution ie before resizing)  |
@@ -185,6 +285,7 @@ Here are all the available options to call with `train.py`
 | --data_sanitize_paths | flag |  | if true, wrong images or labels paths will be removed before training |
 | --data_serial_batches | flag |  | if true, takes images in order to make batches, otherwise takes them randomly |
 | --data_temporal_frame_step | int | 30 | how many frames between successive frames selected |
+| --data_temporal_frame_step_random_max | int | 0 | if \>0, randomly sample temporal frame step uniformly between data_temporal_frame_step and this max for each training sample |
 | --data_temporal_num_common_char | int | -1 | how many characters (the first ones) are used to identify a video; if =-1 natural sorting is used  |
 | --data_temporal_number_frames | int | 5 | how many successive frames use for temporal loader |
 
@@ -199,15 +300,29 @@ Here are all the available options to call with `train.py`
 | --data_online_creation_crop_size_B | int | 512 | crop to this size during online creation, it needs to be greater than bbox size for domain B |
 | --data_online_creation_load_size_A | array | [] | load to this size during online creation, format : width height or only one size if square |
 | --data_online_creation_load_size_B | array | [] | load to this size during online creation, format : width height or only one size if square |
+| --data_online_creation_load_size_keep_ratio_A | flag |  | preserve aspect ratio when loading domain A online; the largest load_size_A side is used as the target largest image side |
+| --data_online_creation_load_size_keep_ratio_B | flag |  | preserve aspect ratio when loading domain B online; the largest load_size_B side is used as the target largest image side |
+| --data_online_creation_mask_bbox_margin_ratio_max | float | 0.5 | maximum independently sampled bbox margin ratio on each side |
+| --data_online_creation_mask_broaden_rect_aug_A | flag |  | randomly broaden online rectangular masks with detector-like bbox augmentations for domain A |
+| --data_online_creation_mask_broaden_rect_aug_B | flag |  | randomly broaden online rectangular masks with detector-like bbox augmentations for domain B |
 | --data_online_creation_mask_delta_A | array | [[]] | mask offset (in pixels) to allow generation of a bigger object in domain B (for semantic loss) for domain A, format : 'width (x),height (y)' for each class or only one size if square, e.g. '125, 55 100, 100' for 2 classes |
 | --data_online_creation_mask_delta_A_ratio | array | [[]] | ratio mask offset to allow generation of a bigger object in domain B (for semantic loss) for domain A, format : width (x),height (y) for each class or only one size if square |
 | --data_online_creation_mask_delta_B | array | [[]] | mask offset (in pixels) to allow generation of a bigger object in domain A (for semantic loss) for domain B, format : 'width (x),height (y)' for each class or only one size if square, e.g. '125, 55 100, 100' for 2 classes |
 | --data_online_creation_mask_delta_B_ratio | array | [[]] | ratio mask offset to allow generation of a bigger object in domain A (for semantic loss) for domain B, format : 'width (x),height (y)' for each class or only one size if square |
+| --data_online_creation_mask_dilate_ratio_max | float | 0.25 | maximum dilation radius as a ratio of the instance bbox short side |
+| --data_online_creation_mask_fixed_size_A | int | -1 | if \>0, force domain A online masks to this square side in final model pixels; larger boxes keep the closest containing square |
+| --data_online_creation_mask_fixed_size_B | int | -1 | if \>0, force domain B online masks to this square side in final model pixels; larger boxes keep the closest containing square |
+| --data_online_creation_mask_min_unmasked_border_A | int | 4 | minimum unmasked border in final model pixels for fixed-size masks and square online masks |
+| --data_online_creation_mask_min_unmasked_border_B | int | 4 | minimum unmasked border in final model pixels for fixed-size masks and square online masks |
+| --data_online_creation_mask_precision_probs | array | [0.2, 0.3, 0.5] | sampling probabilities for exact, dilated, and randomized-bbox B2B mask-precision modes |
 | --data_online_creation_mask_random_offset_A | array | [0.0] | ratio mask size randomization (only to make bigger one) to robustify the image generation in domain A, format : width (x) height (y) or only one size if square |
 | --data_online_creation_mask_random_offset_B | array | [0.0] | mask size randomization (only to make bigger one) to robustify the image generation in domain B, format : width (y) height (x) or only one size if square |
 | --data_online_creation_mask_square_A | flag |  | whether masks should be squared for domain A |
 | --data_online_creation_mask_square_B | flag |  | whether masks should be squared for domain B |
 | --data_online_creation_rand_mask_A | flag |  | Perform task of replacing noised masks by objects |
+| --data_online_creation_rotate_before_crop | flag |  | for online bbox/mask datasets, rotate the loaded full image before online crop creation |
+| --data_online_creation_rotate_max_angle | float | 0.0 | maximum absolute angle for pre-crop online rotation. Angles are sampled uniformly in [-value, value]. |
+| --data_online_creation_rotate_rebox_mask_after_rotation | flag |  | after online pre-crop rotation, replace each rotated mask with its tight axis-aligned bounding box |
 
 ## Semantic segmentation network
 
@@ -243,6 +358,7 @@ Here are all the available options to call with `train.py`
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | --output_no_html | flag |  | do not save intermediate training results to [opt.checkpoints_dir]/[opt.name]/web/ |
+| --output_num_images | int | 20 | number of visualized images results from the train/test set |
 | --output_print_freq | int | 100 | frequency of showing training results on console |
 | --output_update_html_freq | int | 1000 | frequency of saving training results to html |
 | --output_verbose | flag |  | if specified, print more debugging information |
@@ -273,9 +389,10 @@ Here are all the available options to call with `train.py`
 | --model_depth_network | string | DPT_Large | specify depth prediction network architecture<br/><br/> **Values:** DPT_Large, DPT_Hybrid, MiDaS_small, DPT_BEiT_L_512, DPT_BEiT_L_384, DPT_BEiT_B_384, DPT_SwinV2_L_384, DPT_SwinV2_B_384, DPT_SwinV2_T_256, DPT_Swin_L_384, DPT_Next_ViT_L_384, DPT_LeViT_224 |
 | --model_init_gain | float | 0.02 | scaling factor for normal, xavier and orthogonal. |
 | --model_init_type | string | normal | network initialization<br/><br/> **Values:** normal, xavier, kaiming, orthogonal |
-| --model_input_nc | int | 3 | \# of input image channels: 3 for RGB and 1 for grayscale<br/><br/> **Values:** 1, 3 |
+| --model_input_nc | int | 3 | \# of input image channels: 3 for RGB and 1 for grayscale, more supported |
+| --model_load_no_strictness | flag |  | load model without strictness check (strict=False) |
 | --model_multimodal | flag |  | multimodal model with random latent input vector |
-| --model_output_nc | int | 3 | \# of output image channels: 3 for RGB and 1 for grayscale<br/><br/> **Values:** 1, 3 |
+| --model_output_nc | int | 3 | \# of output image channels: 3 for RGB and 1 for grayscale |
 | --model_prior_321_backwardcompatibility | flag |  | whether to load models from previous version of JG. |
 | --model_type_sam | string | mobile_sam | which model to use for segment-anything mask generation<br/><br/> **Values:** sam, mobile_sam |
 
@@ -296,22 +413,25 @@ Here are all the available options to call with `train.py`
 | --train_compute_D_accuracy | flag |  | whether to compute D accuracy explicitely |
 | --train_compute_metrics_test | flag |  | whether to compute test metrics, e.g. FID, ... |
 | --train_continue | flag |  | continue training: load the latest model |
+| --train_continue_from | string |  | initialize this new training run from another checkpoint directory without resuming logs or epoch counters |
 | --train_epoch | string | latest | which epoch to load? set to latest to use latest cached model |
 | --train_epoch_count | int | 1 | the starting epoch count, we save the model by \<epoch_count\>, \<epoch_count\>+\<save_latest_freq\>, ... |
 | --train_export_jit | flag |  | whether to export model in jit format |
 | --train_feat_wavelet | flag |  | if true, train in wavelet features space (Note: this may not include all discriminators, when training GANs) |
+| --train_finetune | flag |  | sets the models into finetune mode, i.e. less checks are applied, e.g. whether a network already exists, to be used in combination with --train_continue |
 | --train_gan_mode | string | lsgan | the type of GAN objective. vanilla GAN loss is the cross-entropy objective used in the original GAN paper.<br/><br/> **Values:** vanilla, lsgan, wgangp, projected |
 | --train_iter_size | int | 1 | backward will be apllied each iter_size iterations, it simulate a greater batch size : its value is batch_size\*iter_size |
 | --train_load_iter | int | 0 | which iteration to load? if load_iter \> 0, the code will load models by iter_[load_iter]; otherwise, the code will load models by [epoch] |
 | --train_lr_decay_iters | int | 50 | multiply by a gamma every lr_decay_iters iterations |
-| --train_lr_policy | string | linear | learning rate policy.<br/><br/> **Values:** linear, step, plateau, cosine |
+| --train_lr_policy | string | linear | learning rate policy.<br/><br/> **Values:** linear, step, multistep, plateau, cosine |
+| --train_lr_steps | array | [] | number of epochs between reductions of the learning rate by gamma=0.1 |
 | --train_metrics_every | int | 1000 | compute metrics every N iterations |
-| --train_metrics_list | array | ['FID'] | metrics on results quality to compute<br/><br/> **Values:** FID, KID, MSID, PSNR, LPIPS, SSIM |
+| --train_metrics_list | array | ['FID'] | metrics on results quality to compute<br/><br/> **Values:** FID, KID, MSID, PSNR, LPIPS, SSIM, DINOv2, FVD |
 | --train_metrics_save_images | flag |  | whether to save images that result form metrics computation |
 | --train_mm_lambda_z | float | 0.5 | weight for random z loss |
 | --train_mm_nz | int | 8 | number of latent vectors |
 | --train_n_epochs | int | 100 | number of epochs with the initial learning rate |
-| --train_n_epochs_decay | int | 100 | number of epochs to linearly decay learning rate to zero |
+| --train_n_epochs_decay | int | 0 | number of epochs to linearly decay learning rate to zero |
 | --train_nb_img_max_fid | int | 1000000000 | Maximum number of samples allowed per dataset to compute fid. If the dataset directory contains more than nb_img_max_fid, only a subset is used. |
 | --train_optim | string | adam | optimizer (adam, radam, adamw, ...)<br/><br/> **Values:** adam, radam, adamw, lion, adam8bit |
 | --train_optim_eps | float | 1e-08 | epsilon for optimizer |
@@ -374,7 +494,7 @@ Here are all the available options to call with `train.py`
 | --dataaug_affine_scale_min | float | 0.8 | if random affine specified, min scale range value |
 | --dataaug_affine_shear | int | 45 | if random affine specified, shear range (0,value) |
 | --dataaug_affine_translate | float | 0.2 | if random affine specified, translation range (-value\*img_size,+value\*img_size) value |
-| --dataaug_diff_aug_policy | string |  | choose the augmentation policy : color randaffine randperspective. If you want more than one, please write them separated by a comma with no space (e.g. color,randaffine) |
+| --dataaug_diff_aug_policy | string |  | choose the augmentation policy : color wild color+wild randaffine randperspective. If you want more than one, please write them separated by a comma with no space (e.g. color,randaffine) |
 | --dataaug_diff_aug_proba | float | 0.5 | proba of using each transformation |
 | --dataaug_flip | string | horizontal | if specified, flip the images for data augmentation, possible values: none, horizontal, vertical, both<br/><br/> **Values:** none, horizontal, vertical, both |
 | --dataaug_imgaug | flag |  | whether to apply random image augmentation |

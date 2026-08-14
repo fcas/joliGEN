@@ -4,9 +4,16 @@ import re
 
 import torch
 
-from data.base_dataset import BaseDataset, get_transform_list
+from data.base_dataset import (
+    BaseDataset,
+    build_masked_global_context_image,
+    get_transform_list,
+    transform_global_context_images,
+)
 from data.image_folder import make_labeled_path_dataset
-from data.online_creation import crop_image
+from data.online_creation import crop_image, sample_online_pre_crop_rotation_state
+from data.temporal_sampling import TemporalFrameStepMixin
+from util.b2b_context import b2b_global_context_enabled_from_opt
 
 
 def atoi(text):
@@ -17,7 +24,7 @@ def natural_keys(text):
     return [atoi(c) for c in re.split("(\d+)", text)]
 
 
-class TemporalLabeledMaskOnlineDataset(BaseDataset):
+class TemporalLabeledMaskOnlineDataset(TemporalFrameStepMixin, BaseDataset):
     def __len__(self):
         """Return the total number of images in the dataset.
         As we have two datasets with potentially different number of images,
@@ -63,8 +70,7 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
 
         self.transform = get_transform_list(self.opt, grayscale=(self.input_nc == 1))
 
-        self.num_frames = opt.data_temporal_number_frames
-        self.frame_step = opt.data_temporal_frame_step
+        self._init_temporal_frame_step_sampling(opt)
 
         self.num_A = len(self.A_img_paths)
         self.range_A = self.num_A - self.num_frames * self.frame_step
@@ -90,17 +96,27 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
         B_label_cls=None,
         index=None,
     ):  # all params are unused
-        index_A = random.randint(0, self.range_A - 1)
+        effective_frame_step_A = self._sample_temporal_frame_step()
+        if self._random_temporal_frame_step_enabled():
+            index_A = self._select_single_temporal_start(
+                self.num_A, effective_frame_step_A
+            )
+            if index_A is None:
+                return None
+        else:
+            index_A = random.randint(0, self.range_A - 1)
 
         images_A = []
         labels_A = []
+        global_context_A = []
+        rotation_state_A = sample_online_pre_crop_rotation_state(self.opt)
 
         ref_A_img_path = self.A_img_paths[index_A]
 
         ref_name_A = ref_A_img_path.split("/")[-1][: self.num_common_char]
 
         for i in range(self.num_frames):
-            cur_index_A = index_A + i * self.frame_step
+            cur_index_A = index_A + i * effective_frame_step_A
 
             if (
                 self.num_common_char != -1
@@ -133,28 +149,83 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
                         mask_random_offset=self.opt.data_online_creation_mask_random_offset_A,
                         crop_delta=self.opt.data_online_creation_crop_delta_A,
                         mask_square=self.opt.data_online_creation_mask_square_A,
+                        broaden_rect_aug=getattr(
+                            self.opt,
+                            "data_online_creation_mask_broaden_rect_aug_A",
+                            False,
+                        ),
                         crop_dim=self.opt.data_online_creation_crop_size_A,
                         output_dim=self.opt.data_load_size,
                         context_pixels=self.opt.data_online_context_pixels,
                         load_size=self.opt.data_online_creation_load_size_A,
+                        load_size_keep_ratio=getattr(
+                            self.opt,
+                            "data_online_creation_load_size_keep_ratio_A",
+                            False,
+                        ),
                         get_crop_coordinates=True,
                         fixed_mask_size=self.opt.data_online_fixed_mask_size,
+                        fixed_mask_size_model=getattr(
+                            self.opt, "data_online_creation_mask_fixed_size_A", -1
+                        ),
+                        fixed_mask_min_unmasked_border_model=getattr(
+                            self.opt,
+                            "data_online_creation_mask_min_unmasked_border_A",
+                            4,
+                        ),
+                        rotation_state=rotation_state_A,
                     )
 
-                cur_A_img, cur_A_label, ref_A_bbox, A_ref_bbox_id = crop_image(
+                crop_result = crop_image(
                     cur_A_img_path,
                     cur_A_label_path,
                     mask_delta=mask_delta_A,
                     mask_random_offset=self.opt.data_online_creation_mask_random_offset_A,
                     crop_delta=self.opt.data_online_creation_crop_delta_A,
                     mask_square=self.opt.data_online_creation_mask_square_A,
+                    broaden_rect_aug=getattr(
+                        self.opt, "data_online_creation_mask_broaden_rect_aug_A", False
+                    ),
                     crop_dim=self.opt.data_online_creation_crop_size_A,
                     output_dim=self.opt.data_load_size,
                     context_pixels=self.opt.data_online_context_pixels,
                     load_size=self.opt.data_online_creation_load_size_A,
+                    load_size_keep_ratio=getattr(
+                        self.opt, "data_online_creation_load_size_keep_ratio_A", False
+                    ),
                     crop_coordinates=crop_coordinates,
                     fixed_mask_size=self.opt.data_online_fixed_mask_size,
+                    fixed_mask_size_model=getattr(
+                        self.opt, "data_online_creation_mask_fixed_size_A", -1
+                    ),
+                    fixed_mask_min_unmasked_border_model=getattr(
+                        self.opt, "data_online_creation_mask_min_unmasked_border_A", 4
+                    ),
+                    return_meta=b2b_global_context_enabled_from_opt(self.opt),
+                    rotation_state=rotation_state_A,
                 )
+                if b2b_global_context_enabled_from_opt(self.opt):
+                    (
+                        cur_A_img,
+                        cur_A_label,
+                        ref_A_bbox,
+                        A_ref_bbox_id,
+                        crop_meta,
+                    ) = crop_result
+                    global_context_A.append(
+                        build_masked_global_context_image(
+                            cur_A_img_path,
+                            crop_meta,
+                            self.opt.data_online_creation_load_size_A,
+                            getattr(
+                                self.opt,
+                                "data_online_creation_load_size_keep_ratio_A",
+                                False,
+                            ),
+                        )
+                    )
+                else:
+                    cur_A_img, cur_A_label, ref_A_bbox, A_ref_bbox_id = crop_result
                 if i == 0:
                     A_ref_bbox = ref_A_bbox[1:]
 
@@ -166,23 +237,40 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
             labels_A.append(cur_A_label)
 
         images_A, labels_A, A_ref_bbox = self.transform(images_A, labels_A, A_ref_bbox)
+        if b2b_global_context_enabled_from_opt(self.opt):
+            global_context_A = transform_global_context_images(
+                self.opt,
+                global_context_A,
+                getattr(self.transform, "last_geometry_state", {}),
+                getattr(self.opt, "alg_b2b_global_context_size", 128),
+            )
         A_ref_label = labels_A[0]
         A_ref_img = images_A[0]
         images_A = torch.stack(images_A)
         labels_A = torch.stack(labels_A)
 
         if self.use_domain_B:
-            index_B = random.randint(0, self.range_B - 1)
+            effective_frame_step_B = self._sample_temporal_frame_step()
+            rotation_state_B = sample_online_pre_crop_rotation_state(self.opt)
+            if self._random_temporal_frame_step_enabled():
+                index_B = self._select_single_temporal_start(
+                    self.num_B, effective_frame_step_B
+                )
+                if index_B is None:
+                    return None
+            else:
+                index_B = random.randint(0, self.range_B - 1)
 
             images_B = []
             labels_B = []
+            global_context_B = []
 
             ref_B_img_path = self.B_img_paths[index_B]
 
             ref_name_B = ref_B_img_path.split("/")[-1][: self.num_common_char]
 
             for i in range(self.num_frames):
-                cur_index_B = index_B + i * self.frame_step
+                cur_index_B = index_B + i * effective_frame_step_B
 
                 if (
                     self.num_common_char != -1
@@ -216,27 +304,88 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
                             mask_random_offset=self.opt.data_online_creation_mask_random_offset_B,
                             crop_delta=self.opt.data_online_creation_crop_delta_B,
                             mask_square=self.opt.data_online_creation_mask_square_B,
+                            broaden_rect_aug=getattr(
+                                self.opt,
+                                "data_online_creation_mask_broaden_rect_aug_B",
+                                False,
+                            ),
                             crop_dim=self.opt.data_online_creation_crop_size_B,
                             output_dim=self.opt.data_load_size,
                             context_pixels=self.opt.data_online_context_pixels,
                             load_size=self.opt.data_online_creation_load_size_B,
+                            load_size_keep_ratio=getattr(
+                                self.opt,
+                                "data_online_creation_load_size_keep_ratio_B",
+                                False,
+                            ),
                             get_crop_coordinates=True,
+                            fixed_mask_size_model=getattr(
+                                self.opt, "data_online_creation_mask_fixed_size_B", -1
+                            ),
+                            fixed_mask_min_unmasked_border_model=getattr(
+                                self.opt,
+                                "data_online_creation_mask_min_unmasked_border_B",
+                                4,
+                            ),
+                            rotation_state=rotation_state_B,
                         )
 
-                    cur_B_img, cur_B_label, ref_B_bbox, B_ref_bbox_id = crop_image(
+                    crop_result = crop_image(
                         cur_B_img_path,
                         cur_B_label_path,
                         mask_delta=mask_delta_B,
                         mask_random_offset=self.opt.data_online_creation_mask_random_offset_B,
                         crop_delta=self.opt.data_online_creation_crop_delta_B,
                         mask_square=self.opt.data_online_creation_mask_square_B,
+                        broaden_rect_aug=getattr(
+                            self.opt,
+                            "data_online_creation_mask_broaden_rect_aug_B",
+                            False,
+                        ),
                         crop_dim=self.opt.data_online_creation_crop_size_B,
                         output_dim=self.opt.data_load_size,
                         context_pixels=self.opt.data_online_context_pixels,
                         load_size=self.opt.data_online_creation_load_size_B,
+                        load_size_keep_ratio=getattr(
+                            self.opt,
+                            "data_online_creation_load_size_keep_ratio_B",
+                            False,
+                        ),
                         crop_coordinates=crop_coordinates,
                         fixed_mask_size=self.opt.data_online_fixed_mask_size,
+                        fixed_mask_size_model=getattr(
+                            self.opt, "data_online_creation_mask_fixed_size_B", -1
+                        ),
+                        fixed_mask_min_unmasked_border_model=getattr(
+                            self.opt,
+                            "data_online_creation_mask_min_unmasked_border_B",
+                            4,
+                        ),
+                        return_meta=b2b_global_context_enabled_from_opt(self.opt),
+                        rotation_state=rotation_state_B,
                     )
+                    if b2b_global_context_enabled_from_opt(self.opt):
+                        (
+                            cur_B_img,
+                            cur_B_label,
+                            ref_B_bbox,
+                            B_ref_bbox_id,
+                            crop_meta,
+                        ) = crop_result
+                        global_context_B.append(
+                            build_masked_global_context_image(
+                                cur_B_img_path,
+                                crop_meta,
+                                self.opt.data_online_creation_load_size_B,
+                                getattr(
+                                    self.opt,
+                                    "data_online_creation_load_size_keep_ratio_B",
+                                    False,
+                                ),
+                            )
+                        )
+                    else:
+                        cur_B_img, cur_B_label, ref_B_bbox, B_ref_bbox_id = crop_result
                     if i == 0:
                         B_ref_bbox = ref_B_bbox[1:]
 
@@ -250,6 +399,13 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
             images_B, labels_B, B_ref_bbox = self.transform(
                 images_B, labels_B, B_ref_bbox
             )
+            if b2b_global_context_enabled_from_opt(self.opt):
+                global_context_B = transform_global_context_images(
+                    self.opt,
+                    global_context_B,
+                    getattr(self.transform, "last_geometry_state", {}),
+                    getattr(self.opt, "alg_b2b_global_context_size", 128),
+                )
             B_ref_label = labels_B[0]
             B_ref_img = images_B[0]
             images_B = torch.stack(images_B)
@@ -262,6 +418,7 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
             ref_B_img_path = ""
             B_ref_bbox = ""
             B_ref_label = ""
+            global_context_B = None
 
         result = {
             "A_ref": A_ref_img,
@@ -270,17 +427,24 @@ class TemporalLabeledMaskOnlineDataset(BaseDataset):
             "A_ref_bbox": A_ref_bbox,
             "A_label_mask": labels_A,
             "A_ref_label_mask": A_ref_label,
+            "A_temporal_frame_step": effective_frame_step_A,
+            "temporal_frame_step": effective_frame_step_A,
         }
+        if b2b_global_context_enabled_from_opt(self.opt):
+            result["A_global_context"] = global_context_A
         if not images_B is None:
-            result.update(
-                {
-                    "B_ref": B_ref_img,
-                    "B": images_B,
-                    "B_img_paths": ref_B_img_path,
-                    "B_ref_bbox": B_ref_bbox,
-                    "B_label_mask": labels_B,
-                    "B_ref_label_mask": B_ref_label,
-                }
-            )
+            b_result = {
+                "B_ref": B_ref_img,
+                "B": images_B,
+                "B_img_paths": ref_B_img_path,
+                "B_ref_bbox": B_ref_bbox,
+                "B_label_mask": labels_B,
+                "B_ref_label_mask": B_ref_label,
+                "B_temporal_frame_step": effective_frame_step_B,
+                "temporal_frame_step": effective_frame_step_B,
+            }
+            if b2b_global_context_enabled_from_opt(self.opt):
+                b_result["B_global_context"] = global_context_B
+            result.update(b_result)
 
         return result

@@ -32,6 +32,7 @@ from util.parser import get_opt
 from util.visualizer import Visualizer
 from util.lion_pytorch import Lion
 from util.script import get_override_options_names
+import datetime
 
 
 def setup(rank, world_size, port):
@@ -39,7 +40,12 @@ def setup(rank, world_size, port):
     os.environ["MASTER_PORT"] = port
 
     # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=5400),
+    )  # modified timeout from default 10 or 30 mins (?) to 1.5h
 
 
 def optim(opt, params, lr, betas, weight_decay, eps):
@@ -49,8 +55,6 @@ def optim(opt, params, lr, betas, weight_decay, eps):
     elif opt.train_optim == "radam":
         return torch.optim.RAdam(params, lr, betas, weight_decay=weight_decay, eps=eps)
     elif opt.train_optim == "adamw":
-        if weight_decay == 0.0:
-            weight_decay = 0.01  # default value
         return torch.optim.AdamW(params, lr, betas, weight_decay=weight_decay, eps=eps)
     elif opt.train_optim == "lion":
         return Lion(params, lr, betas, weight_decay)
@@ -58,8 +62,62 @@ def optim(opt, params, lr, betas, weight_decay, eps):
         return bnb.optim.Adam8bit(params, lr, betas, weight_decay=weight_decay, eps=eps)
 
 
+def get_current_b2b_validation_loss(model, test_names):
+    if getattr(model.opt, "model_type", "") != "b2b":
+        return {}
+
+    loss_sum = 0.0
+    loss_count = 0
+    for test_name in test_names:
+        loss_name = "G_val_loss_test_" + test_name
+        count_name = "G_val_loss_count_test_" + test_name
+        if not hasattr(model, loss_name):
+            continue
+        count = int(getattr(model, count_name, 1))
+        if count <= 0:
+            continue
+        loss_sum += float(getattr(model, loss_name)) * count
+        loss_count += count
+
+    if loss_count == 0:
+        return {}
+
+    return {"G_val_loss": loss_sum / loss_count}
+
+
 def signal_handler(sig, frame):
     dist.destroy_process_group()
+
+
+def get_train_load_suffix(opt):
+    return (
+        "iter_%d" % opt.train_load_iter if opt.train_load_iter > 0 else opt.train_epoch
+    )
+
+
+def save_finetune_source_metadata(opt, command_line, model_names):
+    if not getattr(opt, "train_continue_from", ""):
+        return
+
+    load_suffix = get_train_load_suffix(opt)
+    source_dir = opt.train_continue_from
+    metadata = {
+        "train_continue_from": source_dir,
+        "train_continue_from_abs": os.path.abspath(os.path.expanduser(source_dir)),
+        "load_suffix": load_suffix,
+        "checkpoint_files": [
+            os.path.join(source_dir, "%s_net_%s.pth" % (load_suffix, name))
+            for name in model_names
+            if isinstance(name, str)
+        ],
+        "command_line": command_line,
+    }
+    save_dir = os.path.join(opt.checkpoints_dir, opt.name)
+    os.makedirs(save_dir, exist_ok=True)
+    metadata_path = os.path.join(save_dir, "finetune_source.json")
+    with open(metadata_path, "w") as metadata_file:
+        json.dump(metadata, metadata_file, indent=4)
+    print(f"Finetune source metadata was saved at {metadata_path}")
 
 
 def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
@@ -73,7 +131,6 @@ def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
     signal.signal(signal.SIGTERM, signal_handler)
     if len(opt.gpu_ids) > 1:
         setup(rank, world_size, opt.ddp_port)
-
     dataloader = create_dataloader(
         opt, rank, trainset, batch_size=opt.train_batch_size
     )  # create a dataset given opt.dataset_mode and other options
@@ -134,9 +191,9 @@ def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
     if opt.train_continue:
         opt.train_epoch_count = visualizer.load_data()
         opt.total_iters = opt.train_epoch_count * trainset_size
-
     opt.optim = optim  # set optimizer
     model = create_model(opt, rank)  # create a model given opt.model and other options
+
     if hasattr(model, "data_dependent_initialize"):
         data = next(iter(dataloader))
         model.data_dependent_initialize(data)
@@ -173,11 +230,26 @@ def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
             file.write(command_line)
 
             print(f"Command line was saved at {sv_path}")
+        save_finetune_source_metadata(opt, command_line, model.model_names)
 
     if rank_0:
         ##TODO: realactB_test at init
         for dataloader_test in all_dataloaders_test:
             model.init_metrics(dataloader_test, dataloader_test.dataset.name)
+
+    def capture_model_training_modes(model):
+        modes = []
+        for name in model.model_names:
+            if isinstance(name, str):
+                net_name = "net" + name
+                if hasattr(model, net_name):
+                    net = getattr(model, net_name)
+                    modes.append((net, net.training))
+        return modes
+
+    def restore_model_training_modes(modes):
+        for net, was_training in modes:
+            net.train(was_training)
 
     for epoch in range(
         opt.train_epoch_count, opt.train_n_epochs + opt.train_n_epochs_decay + 1
@@ -249,18 +321,24 @@ def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
                     opt.total_iters % opt.output_display_freq < batch_size
                 ):  # display images on visdom and save images to a HTML file
                     save_result = opt.total_iters % opt.output_update_html_freq == 0
-                    model.compute_visuals(opt.train_batch_size)
-                    if not "none" in opt.output_display_type:
-                        visualizer.display_current_results(
-                            model.get_current_visuals(opt.train_batch_size),
-                            epoch,
-                            save_result,
-                            params=model.get_display_param(),
-                            first=(opt.total_iters == batch_size),
-                            phase="train",
-                            image_bits=opt.data_image_bits,
-                            vwin_id=1,
-                        )
+                    saved_training_modes = capture_model_training_modes(model)
+                    model.eval()
+                    try:
+                        with torch.no_grad():
+                            model.compute_visuals(opt.train_batch_size)
+                            if not "none" in opt.output_display_type:
+                                visualizer.display_current_results(
+                                    model.get_current_visuals(opt.train_batch_size),
+                                    epoch,
+                                    save_result,
+                                    params=model.get_display_param(),
+                                    first=(opt.total_iters == batch_size),
+                                    phase="train",
+                                    image_bits=opt.data_image_bits,
+                                    vwin_id=1,
+                                )
+                    finally:
+                        restore_model_training_modes(saved_training_modes)
 
                 if (
                     opt.total_iters % opt.train_save_latest_freq < batch_size
@@ -281,8 +359,10 @@ def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
                 if opt.total_iters % opt.train_metrics_every < batch_size and (
                     opt.train_compute_metrics_test
                 ):
-                    with torch.no_grad():
-                        if opt.train_compute_metrics_test:
+                    saved_training_modes = capture_model_training_modes(model)
+                    model.eval()
+                    try:
+                        with torch.no_grad():
                             ts = 2
                             for dataloader_test in all_dataloaders_test:
                                 if use_temporal:
@@ -316,12 +396,21 @@ def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
                                     test_name=dataloader_test.dataset.name,
                                 )
                                 ts += 1
+                    finally:
+                        restore_model_training_modes(saved_training_modes)
 
                     if opt.output_display_id > 0:
                         metrics = model.get_current_metrics(all_test_sets)
                         visualizer.plot_current_metrics(
                             epoch, float(epoch_iter) / trainset_size, metrics
                         )
+                        val_losses = get_current_b2b_validation_loss(
+                            model, all_test_sets
+                        )
+                        if val_losses:
+                            visualizer.plot_current_losses(
+                                epoch, float(epoch_iter) / trainset_size, val_losses
+                            )
 
                 if (
                     opt.total_iters % opt.train_D_accuracy_every < batch_size
@@ -384,20 +473,30 @@ def train_gpu(rank, world_size, opt, trainset, trainset_temporal):
 
     ###Let's compute final FID
     if rank_0 and opt.train_compute_metrics_test:
-        with torch.no_grad():
-            for dataloader_test in all_dataloaders_test:
-                if use_temporal:
-                    dataloaders_test = zip(dataloader_test, dataloader_test_temporal)
-                else:
-                    dataloaders_test = zip(dataloader_test)
-                model.compute_metrics_test(
-                    dataloaders_test,
-                    opt.train_epoch_count - 1,
-                    opt.total_iters,
-                    save_images=opt.train_metrics_save_images,
-                    test_name=dataloader_test.dataset.name,
+        saved_training_modes = capture_model_training_modes(model)
+        model.eval()
+        try:
+            with torch.no_grad():
+                for dataloader_test in all_dataloaders_test:
+                    if use_temporal:
+                        dataloaders_test = zip(
+                            dataloader_test, dataloader_test_temporal
+                        )
+                    else:
+                        dataloaders_test = zip(dataloader_test)
+                    model.compute_metrics_test(
+                        dataloaders_test,
+                        opt.train_epoch_count - 1,
+                        opt.total_iters,
+                        save_images=opt.train_metrics_save_images,
+                        test_name=dataloader_test.dataset.name,
+                    )
+                cur_metrics = model.get_current_metrics(all_test_sets)
+                cur_metrics.update(
+                    get_current_b2b_validation_loss(model, all_test_sets)
                 )
-            cur_metrics = model.get_current_metrics(all_test_sets)
+        finally:
+            restore_model_training_modes(saved_training_modes)
         path_json = os.path.join(opt.checkpoints_dir, opt.name, "eval_results.json")
         if os.path.exists(path_json):
             with open(path_json, "r") as loadfile:
@@ -425,8 +524,8 @@ def launch_training(opt):
         warnings.simplefilter("ignore")
 
     trainset = create_dataset(opt, phase="train")
-    print("The number of training images = %d" % len(trainset))
 
+    print("The number of training images = %d" % len(trainset))
     use_temporal = ("temporal" in opt.D_netDs) or opt.train_temporal_criterion
 
     if use_temporal:
@@ -436,6 +535,7 @@ def launch_training(opt):
 
     if opt.with_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     opt.use_cuda = torch.cuda.is_available() and opt.gpu_ids and opt.gpu_ids[0] >= 0
     if opt.use_cuda:

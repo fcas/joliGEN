@@ -25,6 +25,7 @@ class CommonOptions(BaseOptions):
                         "gan": {"title": "GAN model"},
                         "cut": {"title": "CUT model"},
                         "cyclegan": {"title": "CycleGAN model"},
+                        "mat": {"title": "MAT model"},
                         "re": {"title": "ReCUT / ReCycleGAN"},
                         "palette": {"title": "Diffusion model"},
                     },
@@ -118,21 +119,29 @@ class CommonOptions(BaseOptions):
             "--model_type",
             type=str,
             default="cut",
-            choices=["cut", "cycle_gan", "palette", "cm"],
+            choices=[
+                "cut",
+                "cycle_gan",
+                "palette",
+                "cm",
+                "cm_gan",
+                "sc",
+                "b2b",
+                "mat",
+            ],
             help="chooses which model to use.",
         )
         parser.add_argument(
             "--model_input_nc",
             type=int,
             default=3,
-            choices=[1, 3],
-            help="# of input image channels: 3 for RGB and 1 for grayscale",
+            help="# of input image channels: 3 for RGB and 1 for grayscale, more supported",
         )
         parser.add_argument(
             "--model_output_nc",
             type=int,
             default=3,
-            choices=[1, 3],
+            # choices=[1, 3],
             help="# of output image channels: 3 for RGB and 1 for grayscale",
         )
         parser.add_argument(
@@ -152,6 +161,11 @@ class CommonOptions(BaseOptions):
             "--model_multimodal",
             action="store_true",
             help="multimodal model with random latent input vector",
+        )
+        parser.add_argument(
+            "--model_load_no_strictness",
+            action="store_true",
+            help="load model without strictness check (strict=False)",
         )
 
         # depth network
@@ -210,6 +224,10 @@ class CommonOptions(BaseOptions):
                 "dit",
                 "hdit",
                 "img2img_turbo",
+                "unet_vid",
+                "vit_vid",
+                "hat",
+                "vit",
             ],
             help="specify generator architecture",
         )
@@ -386,12 +404,23 @@ class CommonOptions(BaseOptions):
             type=int,
             help="Patch size for HDIT, e.g. 4 for 4x4 patches",
         )
-
         parser.add_argument(
-            "--G_prompt",
-            type=str,
-            default="",
-            help="Text prompt for G",
+            "--G_unet_vid_max_sequence_length",
+            default=25,
+            type=int,
+            help="max frame number(sequence length) for unet_vid in the PositionalEncoding",
+        )
+        parser.add_argument(
+            "--G_unet_vid_num_attention_heads",
+            default=8,
+            type=int,
+            help="number of attention heads for unet_vid motion module, 8, 4, ...",
+        )
+        parser.add_argument(
+            "--G_unet_vid_num_transformer_blocks",
+            default=2,
+            type=int,
+            help="number of unet_vid motion module transformer blocks, 2, 1, ...",
         )
         parser.add_argument(
             "--G_lora_unet",
@@ -404,6 +433,39 @@ class CommonOptions(BaseOptions):
             type=int,
             default=8,
             help="lora vae rank for G",
+        )
+        parser.add_argument(
+            "--G_vit_variant",
+            type=str,
+            default="JiT-B/16",
+            help="Selects the ViT backbone when --G_netG vit (use JiT-*) or vit_vid (use JiTVid-*)",
+        )
+        parser.add_argument(
+            "--G_vit_disable_bottleneck",
+            action="store_true",
+            help="Disable JiT bottleneck by forcing bottleneck_dim=hidden_size for vit/vit_vid.",
+        )
+        parser.add_argument(
+            "--G_vit_num_classes",
+            type=int,
+            default=1,
+            help="number of class labels used by vit/vit_vid class embeddings",
+        )
+        parser.add_argument(
+            "--G_vit_num_register_tokens",
+            type=int,
+            default=0,
+            help="number of learned register prefix tokens used by vit/vit_vid; 0 disables them",
+        )
+        parser.add_argument(
+            "--G_vit_vid_motion_every",
+            type=int,
+            default=0,
+            help=(
+                "JiTViD temporal motion insertion interval. 0 keeps the default "
+                "last-layer-only motion module; 1 inserts after every ViT block; "
+                "2 inserts after every two blocks."
+            ),
         )
 
         # discriminator
@@ -427,6 +489,7 @@ class CommonOptions(BaseOptions):
                 "depth",
                 "mask",
                 "sam",
+                "none",
             ]
             + list(TORCH_MODEL_CLASSES.keys()),
             help="specify discriminator architecture, another option, --D_n_layers allows you to specify the layers in the n_layers discriminator. NB: duplicated arguments are ignored. Values: basic, n_layers, pixel, projected_d, temporal, vision_aided, depth, mask, sam",
@@ -658,14 +721,27 @@ class CommonOptions(BaseOptions):
                 "aligned",
                 "nuplet_unaligned_labeled_mask",
                 "temporal_labeled_mask_online",
+                "self_supervised_vid_mask_online",
+                "multi_dataset",
+                "self_supervised_vid_labeled_mask_cls_online",
                 "self_supervised_temporal",
                 "single",
                 "unaligned_labeled_mask_ref",
                 "self_supervised_labeled_mask_ref",
                 "unaligned_labeled_mask_online_ref",
+                "unaligned_labeled_mask_online_prompt",
                 "self_supervised_labeled_mask_online_ref",
             ],
             help="chooses how datasets are loaded.",
+        )
+        parser.add_argument(
+            "--data_multi_dataset_config",
+            type=str,
+            default="",
+            help=(
+                "path to a JSON config describing child datasets for "
+                "data_dataset_mode=multi_dataset"
+            ),
         )
         parser.add_argument(
             "--data_direction",
@@ -754,6 +830,36 @@ class CommonOptions(BaseOptions):
             help="load to this size during online creation, format : width height or only one size if square",
         )
         parser.add_argument(
+            "--data_online_creation_load_size_keep_ratio_A",
+            action="store_true",
+            help="preserve aspect ratio when loading domain A online; the largest load_size_A side is used as the target largest image side",
+        )
+        parser.add_argument(
+            "--data_online_creation_rotate_before_crop",
+            action="store_true",
+            help=(
+                "for online bbox/mask datasets, rotate the loaded full image "
+                "before online crop creation"
+            ),
+        )
+        parser.add_argument(
+            "--data_online_creation_rotate_max_angle",
+            type=float,
+            default=0.0,
+            help=(
+                "maximum absolute angle for pre-crop online rotation. "
+                "Angles are sampled uniformly in [-value, value]."
+            ),
+        )
+        parser.add_argument(
+            "--data_online_creation_rotate_rebox_mask_after_rotation",
+            action="store_true",
+            help=(
+                "after online pre-crop rotation, replace each rotated mask "
+                "with its tight axis-aligned bounding box"
+            ),
+        )
+        parser.add_argument(
             "--data_online_creation_crop_size_A",
             type=int,
             default=512,
@@ -764,6 +870,12 @@ class CommonOptions(BaseOptions):
             type=int,
             default=50,
             help="size of crops are random, values allowed are online_creation_crop_size more or less online_creation_crop_delta for domain A",
+        )
+        parser.add_argument(
+            "--data_multi_dataset_crop_delta_scale",
+            type=float,
+            default=1.0,
+            help="scale per-child data_online_creation_crop_delta_A overrides in multi_dataset mode",
         )
         parser.add_argument(
             "--data_online_creation_mask_delta_A",
@@ -790,9 +902,50 @@ class CommonOptions(BaseOptions):
         )
 
         parser.add_argument(
+            "--data_online_creation_mask_broaden_rect_aug_A",
+            action="store_true",
+            help="randomly broaden online rectangular masks with detector-like bbox augmentations for domain A",
+        )
+        parser.add_argument(
+            "--data_online_creation_mask_precision_probs",
+            type=float,
+            nargs="+",
+            default=[0.2, 0.3, 0.5],
+            metavar="P",
+            help=(
+                "sampling probabilities for exact, dilated, and randomized-bbox "
+                "B2B mask-precision modes"
+            ),
+        )
+        parser.add_argument(
+            "--data_online_creation_mask_dilate_ratio_max",
+            type=float,
+            default=0.25,
+            help="maximum dilation radius as a ratio of the instance bbox short side",
+        )
+        parser.add_argument(
+            "--data_online_creation_mask_bbox_margin_ratio_max",
+            type=float,
+            default=0.5,
+            help="maximum independently sampled bbox margin ratio on each side",
+        )
+
+        parser.add_argument(
             "--data_online_creation_mask_square_A",
             action="store_true",
             help="whether masks should be squared for domain A",
+        )
+        parser.add_argument(
+            "--data_online_creation_mask_fixed_size_A",
+            type=int,
+            default=-1,
+            help="if >0, force domain A online masks to this square side in final model pixels; larger boxes keep the closest containing square",
+        )
+        parser.add_argument(
+            "--data_online_creation_mask_min_unmasked_border_A",
+            type=int,
+            default=4,
+            help="minimum unmasked border in final model pixels for fixed-size masks and square online masks",
         )
         parser.add_argument(
             "--data_online_creation_rand_mask_A",
@@ -811,6 +964,11 @@ class CommonOptions(BaseOptions):
             nargs="*",
             type=int,
             help="load to this size during online creation, format : width height or only one size if square",
+        )
+        parser.add_argument(
+            "--data_online_creation_load_size_keep_ratio_B",
+            action="store_true",
+            help="preserve aspect ratio when loading domain B online; the largest load_size_B side is used as the target largest image side",
         )
 
         parser.add_argument(
@@ -850,9 +1008,27 @@ class CommonOptions(BaseOptions):
         )
 
         parser.add_argument(
+            "--data_online_creation_mask_broaden_rect_aug_B",
+            action="store_true",
+            help="randomly broaden online rectangular masks with detector-like bbox augmentations for domain B",
+        )
+
+        parser.add_argument(
             "--data_online_creation_mask_square_B",
             action="store_true",
             help="whether masks should be squared for domain B",
+        )
+        parser.add_argument(
+            "--data_online_creation_mask_fixed_size_B",
+            type=int,
+            default=-1,
+            help="if >0, force domain B online masks to this square side in final model pixels; larger boxes keep the closest containing square",
+        )
+        parser.add_argument(
+            "--data_online_creation_mask_min_unmasked_border_B",
+            type=int,
+            default=4,
+            help="minimum unmasked border in final model pixels for fixed-size masks and square online masks",
         )
         parser.add_argument(
             "--data_online_context_pixels",
@@ -881,6 +1057,15 @@ class CommonOptions(BaseOptions):
             type=int,
             default=30,
             help="how many frames between successive frames selected",
+        )
+        parser.add_argument(
+            "--data_temporal_frame_step_random_max",
+            type=int,
+            default=0,
+            help=(
+                "if >0, randomly sample temporal frame step uniformly between "
+                "data_temporal_frame_step and this max for each training sample"
+            ),
         )
 
         parser.add_argument(
@@ -944,6 +1129,33 @@ class CommonOptions(BaseOptions):
                 opt.gpu_ids.append(id)
         if set_device and len(opt.gpu_ids) > 0 and torch.cuda.is_available():
             torch.cuda.set_device(opt.gpu_ids[0])
+
+        if (
+            opt.data_temporal_frame_step_random_max > 0
+            and opt.data_temporal_frame_step_random_max < opt.data_temporal_frame_step
+        ):
+            raise ValueError(
+                "--data_temporal_frame_step_random_max must be 0 or >= "
+                "--data_temporal_frame_step"
+            )
+        if opt.data_online_creation_rotate_max_angle < 0:
+            raise ValueError("--data_online_creation_rotate_max_angle must be >= 0")
+        if (
+            opt.data_online_creation_rotate_before_crop
+            and opt.data_online_creation_rotate_max_angle <= 0
+        ):
+            raise ValueError(
+                "--data_online_creation_rotate_before_crop requires "
+                "--data_online_creation_rotate_max_angle > 0"
+            )
+        if (
+            opt.data_online_creation_rotate_rebox_mask_after_rotation
+            and not opt.data_online_creation_rotate_before_crop
+        ):
+            raise ValueError(
+                "--data_online_creation_rotate_rebox_mask_after_rotation requires "
+                "--data_online_creation_rotate_before_crop"
+            )
 
         # multimodal check
         if opt.model_multimodal:

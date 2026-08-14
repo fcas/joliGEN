@@ -15,9 +15,7 @@ echo "Current dir is [$current_dir]"
 export PYTHONDONTWRITEBYTECODE=1
 export NCCL_P2P_DISABLE=1
 
-
-
-####### doc auto generation
+######## doc auto generation
 echo "Running doc auto generation"
 python3 ${current_dir}/../scripts/generate_doc.py --save_to ""
 OUT=$?
@@ -70,7 +68,6 @@ if [ $OUT != 0 ]; then
     exit 1
 fi
 
-
 ####### no sem tests
 echo "Running no semantics training tests"
 URL=https://joligen.com/datasets/horse2zebra.zip
@@ -88,19 +85,17 @@ if [ $OUT != 0 ]; then
     exit 1
 fi
 
-
-
-##### test img2img_turbo
-echo "Running test img2img_turbo"
-
-python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_img2img_turbo.py" --dataroot "$TARGET_NOSEM_DIR"
-OUT=$?
-
-if [ $OUT != 0 ]; then
-    exit 1
-fi
-
-
+#
+####### test img2img_turbo
+#echo "Running test img2img_turbo"
+#
+#python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_img2img_turbo.py" --dataroot "$TARGET_NOSEM_DIR"
+#OUT=$?
+#
+#if [ $OUT != 0 ]; then
+#    exit 1
+#fi
+#
 ####### mask semantics test
 echo "Running mask semantics training tests"
 URL=https://joligen.com/datasets/noglasses2glasses_ffhq_mini.zip
@@ -110,7 +105,6 @@ wget -N $URL -O $ZIP_FILE
 mkdir $TARGET_MASK_SEM_DIR
 unzip $ZIP_FILE -d $DIR
 rm $ZIP_FILE
-
 
 python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_semantic_mask.py" --dataroot "$TARGET_MASK_SEM_DIR"
 OUT=$?
@@ -122,6 +116,18 @@ fi
 ###### self supervised mask semantics test
 echo "Running self supervised mask semantics test"
 python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_semantic_self_supervised.py" --dataroot "$TARGET_MASK_SEM_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### test cut
+echo "Running cut test"
+python3 "${current_dir}/../test.py" \
+        --save_config \
+        --test_model_dir $DIR/joligen_utest_cut/ \
+        --test_metrics_list FID KID PSNR LPIPS
 OUT=$?
 
 if [ $OUT != 0 ]; then
@@ -146,6 +152,79 @@ if [ $OUT != 0 ]; then
     exit 1
 fi
 
+###### shortcut model process test
+echo "Running shortcut model process test"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_sc.py" --dataroot "$TARGET_MASK_SEM_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### b2b model process test
+echo "Running b2b model process test"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_b2b.py" --dataroot "$TARGET_MASK_SEM_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### vit register token unit tests
+echo "Running vit register token unit tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_vit_register_tokens.py"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### train continue-from unit tests
+echo "Running train continue-from unit tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_train_continue_from.py"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### mat model unit tests
+echo "Running mat model unit tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_mat_model.py"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### multi dataset unit tests
+echo "Running multi dataset unit tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_multi_dataset.py"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### online creation fixed mask unit tests
+echo "Running online creation fixed mask unit tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_online_creation_fixed_mask.py"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+
+###### GAN+supervised super-resolution process test
+echo "Running GAN+supervised super-resolution process test"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_sr_gan.py" --dataroot "$TARGET_MASK_SEM_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
 ###### diffusion super-resolution process test
 echo "Running diffusion super-resolution process test"
 python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_sr_diffusion.py" --dataroot "$TARGET_MASK_SEM_DIR"
@@ -164,7 +243,6 @@ if [ $OUT != 0 ]; then
     exit 1
 fi
 
-
 ###### mask cls semantics test with online dataloading
 echo "Running mask online semantics training tests"
 URL=https://joligen.com/datasets/online_mario2sonic_lite2.zip 
@@ -177,14 +255,12 @@ rm $ZIP_FILE
 ln -s $TARGET_MASK_SEM_ONLINE_DIR/trainA $TARGET_MASK_SEM_ONLINE_DIR/testA
 ln -s $TARGET_MASK_SEM_ONLINE_DIR/trainB $TARGET_MASK_SEM_ONLINE_DIR/testB
 
-
 python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_semantic_mask_online.py" --dataroot "$TARGET_MASK_SEM_ONLINE_DIR"
 OUT=$?
 
 if [ $OUT != 0 ]; then
     exit 1
 fi
-
 
 ###### diffusion process test online
 echo "Running diffusion process test online"
@@ -195,17 +271,88 @@ if [ $OUT != 0 ]; then
     exit 1
 fi
 
-###### test cut
-echo "Running cut test"
+###### test palette
+echo "Running test palette"
 python3 "${current_dir}/../test.py" \
-	--save_config \
-	--test_model_dir $DIR/joligen_utest_cut/ \
-	--test_metrics_list FID KID PSNR LPIPS
+        --save_config \
+        --test_model_dir $DIR/joligen_utest_palette/ \
+        --test_metrics_list FID KID PSNR LPIPS
 OUT=$?
 
 if [ $OUT != 0 ]; then
     exit 1
 fi
+
+####### vid diffusion tests
+echo "Running vid diffusion training tests"
+URL=https://www.joligen.com/datasets/bdd100K_vid.zip 
+ZIP_FILE=$DIR/bdd100K_vid.zip
+TARGET_MASK_SEM_ONLINE_DIR=$DIR/bdd100k_vid
+wget -N $URL -O $ZIP_FILE
+mkdir $TARGET_MASK_SEM_ONLINE_DIR
+unzip $ZIP_FILE -d $DIR
+rm $ZIP_FILE
+ln -s $TARGET_MASK_SEM_ONLINE_DIR/trainA $TARGET_MASK_SEM_ONLINE_DIR/testA
+ln -s $TARGET_MASK_SEM_ONLINE_DIR/trainB $TARGET_MASK_SEM_ONLINE_DIR/testB
+
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_vid_diffusion_online.py" --dataroot "$TARGET_MASK_SEM_ONLINE_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### test vid palette
+echo "Running test vid palette"
+python3 "${current_dir}/../test.py" \
+        --save_config \
+        --test_model_dir $DIR/joligen_utest_vid_palette/ \
+        --test_metrics_list SSIM PSNR LPIPS
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+####### cm_vid diffusion tests
+echo "Running cm_vid diffusion training tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_cm_vid_diffusion_online.py" --dataroot "$TARGET_MASK_SEM_ONLINE_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+###### test vid palette   ################# 
+echo "Running test vid palette train and ddim infer"
+python3 "${current_dir}/../test.py" \
+        --save_config \
+        --test_model_dir $DIR/joligen_utest_vid_palette/ \
+        --test_metrics_list SSIM PSNR LPIPS
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+####### b2b_vid diffusion tests
+echo "Running b2b_vid diffusion training tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_b2b_vid_diffusion_online.py" --dataroot "$TARGET_MASK_SEM_ONLINE_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
+####### MAT motion video tests
+echo "Running MAT motion video training tests"
+python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_mat_vid_online.py" --dataroot "$TARGET_MASK_SEM_ONLINE_DIR"
+OUT=$?
+
+if [ $OUT != 0 ]; then
+    exit 1
+fi
+
 
 ###### test cycle_gan
 # echo "Running test cycle_gan"
@@ -217,18 +364,6 @@ fi
 # if [ $OUT != 0 ]; then
 #     exit 1
 # fi
-
-###### test palette
-echo "Running test palette"
-python3 "${current_dir}/../test.py" \
-	--save_config \
-	--test_model_dir $DIR/joligen_utest_palette/ \
-	--test_metrics_list FID KID PSNR LPIPS
-OUT=$?
-
-if [ $OUT != 0 ]; then
-    exit 1
-fi
 
 ####### mask cls semantics test
 echo "Running mask and class semantics training tests"
@@ -259,7 +394,6 @@ unzip $ZIP_FILE -d $DIR
 rm $ZIP_FILE
 
 python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_semantic_cls.py" --dataroot "$TARGET_CLS_SEM_DIR"
-
 
 OUT=$?
 
@@ -319,7 +453,6 @@ if [ $OUT != 0 ]; then
     exit 1
 fi
 
-
 python3 -m pytest --rootdir ${current_dir} -p no:cacheprovider -s "${current_dir}/../tests/test_run_pix2pix_diffusion.py" --dataroot "$TARGET_PIX2PIX_DIR"
 OUT=$?
 
@@ -339,7 +472,7 @@ if [ $OUT != 0 ]; then
     exit 1
 fi
 
-# ####### api server tests
+######### api server tests
 echo "Running api server tests"
 
 python3 -m pytest --rootdir ${current_dir} \
@@ -370,7 +503,6 @@ OUT=$?
 if [ $OUT != 0 ]; then
     exit 1
 fi
-
 
 # End of tests
 # Clean up

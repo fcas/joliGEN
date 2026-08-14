@@ -13,6 +13,7 @@ import torch
 import torchvision
 from torchvision.transforms import InterpolationMode
 import torchvision.transforms as transforms
+from data.utils import load_image
 
 if torch.__version__[0] == "2":
     torchvision.disable_beta_transforms_warning()
@@ -25,6 +26,32 @@ from data.image_folder import make_dataset, make_dataset_path, make_labeled_path
 from data.online_creation import sanitize_paths, write_paths_file
 
 from abc import ABC, abstractmethod
+
+
+def _patch_numpy_for_imgaug():
+    """Provide attributes removed in NumPy 2 that imgaug 0.4.0 still expects."""
+    if "sctypes" not in np.__dict__:
+        np.sctypes = {
+            "int": [np.int8, np.int16, np.int32, np.int64],
+            "uint": [np.uint8, np.uint16, np.uint32, np.uint64],
+            "float": [np.float16, np.float32, np.float64],
+            "complex": [np.complex64, np.complex128],
+            "others": [np.bool_, np.bytes_, np.str_],
+        }
+
+    for name, value in (
+        ("float", float),
+        ("int", int),
+        ("bool", bool),
+        ("complex", complex),
+        ("object", object),
+        ("str", str),
+    ):
+        if name not in np.__dict__:
+            setattr(np, name, value)
+
+
+_patch_numpy_for_imgaug()
 import imgaug as ia
 import imgaug.augmenters as iaa
 import os
@@ -62,6 +89,11 @@ class BaseDataset(data.Dataset, ABC):
         self.sv_dir = os.path.join(opt.checkpoints_dir, opt.name)
         self.warning_mode = self.opt.warning_mode
         self.set_dataset_dirs_and_dims()
+
+        if opt.data_image_bits > 8 and opt.model_input_nc > 1:
+            self.use_tiff = True  # multi-channel images > 8bit
+        else:
+            self.use_tiff = False
 
     @staticmethod
     def modify_commandline_options(parser, is_train):
@@ -299,11 +331,23 @@ class BaseDataset(data.Dataset, ABC):
                 mask_random_offset=self.opt.data_online_creation_mask_random_offset_A,
                 crop_delta=self.opt.data_online_creation_crop_delta_A,
                 mask_square=self.opt.data_online_creation_mask_square_A,
+                broaden_rect_aug=getattr(
+                    self.opt, "data_online_creation_mask_broaden_rect_aug_A", False
+                ),
+                fixed_mask_size_model=getattr(
+                    self.opt, "data_online_creation_mask_fixed_size_A", -1
+                ),
+                fixed_mask_min_unmasked_border_model=getattr(
+                    self.opt, "data_online_creation_mask_min_unmasked_border_A", 4
+                ),
                 crop_dim=self.opt.data_online_creation_crop_size_A,
                 output_dim=self.opt.data_load_size,
                 max_dataset_size=self.opt.data_max_dataset_size,
                 context_pixels=self.opt.data_online_context_pixels,
                 load_size=self.opt.data_online_creation_load_size_A,
+                load_size_keep_ratio=getattr(
+                    self.opt, "data_online_creation_load_size_keep_ratio_A", False
+                ),
                 select_cat=self.opt.data_online_select_category,
                 data_relative_paths=self.opt.data_relative_paths,
                 data_root_path=self.opt.dataroot,
@@ -323,11 +367,23 @@ class BaseDataset(data.Dataset, ABC):
                     mask_random_offset=self.opt.data_online_creation_mask_random_offset_B,
                     crop_delta=self.opt.data_online_creation_crop_delta_B,
                     mask_square=self.opt.data_online_creation_mask_square_B,
+                    broaden_rect_aug=getattr(
+                        self.opt, "data_online_creation_mask_broaden_rect_aug_B", False
+                    ),
+                    fixed_mask_size_model=getattr(
+                        self.opt, "data_online_creation_mask_fixed_size_B", -1
+                    ),
+                    fixed_mask_min_unmasked_border_model=getattr(
+                        self.opt, "data_online_creation_mask_min_unmasked_border_B", 4
+                    ),
                     crop_dim=self.opt.data_online_creation_crop_size_B,
                     output_dim=self.opt.data_load_size,
                     max_dataset_size=self.opt.data_max_dataset_size,
                     context_pixels=self.opt.data_online_context_pixels,
                     load_size=self.opt.data_online_creation_load_size_B,
+                    load_size_keep_ratio=getattr(
+                        self.opt, "data_online_creation_load_size_keep_ratio_B", False
+                    ),
                     data_relative_paths=self.opt.data_relative_paths,
                     data_root_path=self.opt.dataroot,
                 )
@@ -358,6 +414,15 @@ def get_params(opt, size):
     angle = random.randint(0, 3) * 90  # 0, 90, 180, 270
 
     return {"crop_pos": (x, y), "fliph": fliph, "flipv": flipv, "angle": angle}
+
+
+def online_pre_crop_rotation_enabled(opt):
+    return (
+        not getattr(opt, "dataaug_no_rotate", False)
+        and bool(getattr(opt, "data_online_creation_rotate_before_crop", False))
+        and float(getattr(opt, "data_online_creation_rotate_max_angle", 0.0)) > 0.0
+        and "online" in getattr(opt, "data_dataset_mode", "")
+    )
 
 
 def get_transform(
@@ -395,10 +460,10 @@ def get_transform(
                 )
             )
 
-    if opt.data_preprocess == "none":
-        transform_list.append(
-            transforms.Lambda(lambda img: __make_power_2(img, base=4, method=method))
-        )
+    # if opt.data_preprocess == "none":
+    #   transform_list.append(
+    #       transforms.Lambda(lambda img: __make_power_2(img, base=4, method=method))
+    #   )
 
     if opt.dataaug_flip != "none":
         if params is None:
@@ -423,7 +488,7 @@ def get_transform(
                     )
                 )
 
-    if not opt.dataaug_no_rotate:
+    if not opt.dataaug_no_rotate and not online_pre_crop_rotation_enabled(opt):
         if params is None or not "angle" in params:
             transform_list.append(transforms.RandomRotation([-90, 180]))
         elif params["angle"]:
@@ -549,7 +614,7 @@ def get_transform_seg(
     margin = opt.data_online_context_pixels * 2
 
     transform_list = []
-    print("method seg", method)
+    # print("method seg", method)
 
     if grayscale:
         transform_list.append(GrayscaleMask(1))
@@ -578,7 +643,7 @@ def get_transform_seg(
             transform_list.append(RandomVerticalFlipMask())
         transform_list.append(RandomHorizontalFlipMask())
 
-    if not opt.dataaug_no_rotate:
+    if not opt.dataaug_no_rotate and not online_pre_crop_rotation_enabled(opt):
         transform_list.append(
             RandomRotationMask(degrees=0)
         )  # XXX: degrees is a required placeholder, unused
@@ -1083,7 +1148,7 @@ def get_transform_list(
     margin = opt.data_online_context_pixels * 2
 
     transform_list = []
-    print("method seg", method)
+    # print("method seg", method)
 
     if grayscale:
         transform_list.append(GrayscaleMaskList(1))
@@ -1104,10 +1169,10 @@ def get_transform_list(
         elif opt.dataaug_flip == "vertical":
             transform_list.append(RandomVerticalFlipMaskList())
         elif opt.dataaug_flip == "both":
-            transform_list.append(RandomHorizonalFlipMaskList())
+            transform_list.append(RandomHorizontalFlipMaskList())
             transform_list.append(RandomVerticalFlipMaskList())
 
-    if not opt.dataaug_no_rotate:
+    if not opt.dataaug_no_rotate and not online_pre_crop_rotation_enabled(opt):
         transform_list.append(RandomRotationMaskList(degrees=0))
 
     if opt.dataaug_affine:
@@ -1131,6 +1196,111 @@ def get_transform_list(
     return ComposeMaskList(transform_list)
 
 
+def build_masked_global_context_image(
+    img_path,
+    crop_meta,
+    load_size,
+    load_size_keep_ratio=False,
+):
+    img = load_image(img_path).convert("RGB")
+    old_width, old_height = img.size
+
+    if load_size not in (None, []):
+        target_width = int(load_size[0])
+        target_height = int(load_size[1] if len(load_size) > 1 else load_size[0])
+        if load_size_keep_ratio:
+            scale = max(target_width, target_height) / float(max(old_width, old_height))
+            new_width = max(1, int(round(old_width * scale)))
+            new_height = max(1, int(round(old_height * scale)))
+        else:
+            new_width = target_width
+            new_height = target_height
+        img = F.resize(img, (new_height, new_width))
+
+    arr = np.array(img).copy()
+    rotation = crop_meta.get("rotation")
+    if rotation is not None and abs(float(rotation.get("angle", 0.0))) > 1e-6:
+        img = F.rotate(
+            Image.fromarray(arr),
+            float(rotation["angle"]),
+            interpolation=InterpolationMode.BICUBIC,
+            expand=True,
+            fill=0,
+        )
+        arr = np.array(img).copy()
+    height, width = arr.shape[:2]
+    for bbox in crop_meta.get("processed_bboxes", []):
+        xmin = max(0, min(width, int(bbox["xmin"])))
+        xmax = max(0, min(width, int(bbox["xmax"])))
+        ymin = max(0, min(height, int(bbox["ymin"])))
+        ymax = max(0, min(height, int(bbox["ymax"])))
+        if xmax > xmin and ymax > ymin:
+            arr[ymin:ymax, xmin:xmax, :] = 0
+    return Image.fromarray(arr)
+
+
+def transform_global_context_images(
+    opt,
+    imgs,
+    geometry_state,
+    context_size,
+):
+    transformed = []
+    size = [int(context_size), int(context_size)]
+    for img in imgs:
+        img = F.resize(img, size, interpolation=InterpolationMode.BICUBIC)
+        if geometry_state.get("fliph", False):
+            img = F.hflip(img)
+        if geometry_state.get("flipv", False):
+            img = F.vflip(img)
+        angle = geometry_state.get("angle", 0)
+        if angle:
+            img = F.rotate(img, angle)
+        tensor_img = F.to_tensor(img)
+        tensor_img = F.normalize(
+            tensor_img,
+            (0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5),
+        )
+        transformed.append(tensor_img)
+    return torch.stack(transformed)
+
+
+def transform_object_reference_images(paths, ref_size):
+    size = int(ref_size)
+    if size <= 0:
+        raise ValueError("object reference size must be > 0")
+    if not paths:
+        return None
+
+    transformed = []
+    for path in paths:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"object reference image not found: {path}")
+        img = load_image(path).convert("RGB")
+        width, height = img.size
+        scale = min(size / float(width), size / float(height))
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        img = F.resize(
+            img,
+            (new_height, new_width),
+            interpolation=InterpolationMode.BICUBIC,
+        )
+        canvas = Image.new("RGB", (size, size), (0, 0, 0))
+        paste_x = (size - new_width) // 2
+        paste_y = (size - new_height) // 2
+        canvas.paste(img, (paste_x, paste_y))
+        tensor_img = F.to_tensor(canvas)
+        tensor_img = F.normalize(
+            tensor_img,
+            (0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5),
+        )
+        transformed.append(tensor_img)
+    return torch.stack(transformed)
+
+
 class ComposeMaskList(transforms.Compose):
     """Composes several transforms together.
 
@@ -1145,6 +1315,7 @@ class ComposeMaskList(transforms.Compose):
     """
 
     def __call__(self, imgs, masks=None, bbox=None):
+        self.last_geometry_state = {}
         if bbox is None:
             w, h = imgs[0].size
             bbox = np.array([0, 0, w, h])  # sets bbox to full image size
@@ -1158,6 +1329,8 @@ class ComposeMaskList(transforms.Compose):
             tbbox = bbox  # placeholder
         for t in self.transforms:
             imgs, masks, tbbox = t(imgs, masks, tbbox)
+            if hasattr(t, "last_geometry_state"):
+                self.last_geometry_state.update(t.last_geometry_state)
         return imgs, masks, tbbox
 
 
@@ -1324,7 +1497,9 @@ class RandomHorizontalFlipMaskList(transforms.RandomHorizontalFlip):
         Returns:
             PIL Image: Randomly flipped image.
         """
-        if random.random() < self.p:
+        should_flip = random.random() < self.p
+        self.last_geometry_state = {"fliph": should_flip}
+        if should_flip:
             return_imgs, return_masks = [], []
             for img in imgs:
                 return_imgs.append(F.hflip(img))
@@ -1354,7 +1529,9 @@ class RandomVerticalFlipMaskList(transforms.RandomVerticalFlip):
         Returns:
             PIL Image: Randomly flipped image.
         """
-        if random.random() < self.p:
+        should_flip = random.random() < self.p
+        self.last_geometry_state = {"flipv": should_flip}
+        if should_flip:
             return_imgs, return_masks = [], []
             for img in imgs:
                 return_imgs.append(F.vflip(img))
@@ -1445,6 +1622,7 @@ class RandomRotationMaskList(transforms.RandomRotation):
             PIL Image: Rotated image.
         """
         angle = random.choice([0, 90, 180, 270])
+        self.last_geometry_state = {"angle": angle}
 
         return_imgs, return_masks = [], []
         for img in imgs:

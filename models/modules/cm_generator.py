@@ -186,6 +186,28 @@ def output_scaling(
     return (sigma_data * (sigma - sigma_min)) / (sigma_data**2 + sigma**2) ** 0.5
 
 
+def output_scaling_train(
+    sigma: Tensor, sigma_data: float = 0.5, sigma_min: float = 0.002
+) -> Tensor:
+    """Computes the scaling value for the model's output.
+
+    Parameters
+    ----------
+    sigma : Tensor
+        Current standard deviation of the noise.
+    sigma_data : float, default=0.5
+        Standard deviation of the data.
+    sigma_min : float, default=0.002
+        Minimum standard deviation of the noise from the karras schedule.
+
+    Returns
+    -------
+    Tensor
+        Scaling value for the model's output.
+    """
+    return (sigma_data * sigma) / (sigma_data**2 + sigma**2) ** 0.5
+
+
 def skip_scaling(
     sigma: Tensor, sigma_data: float = 0.5, sigma_min: float = 0.002
 ) -> Tensor:
@@ -208,18 +230,48 @@ def skip_scaling(
     return sigma_data**2 / ((sigma - sigma_min) ** 2 + sigma_data**2)
 
 
+def skip_scaling_train(
+    sigma: Tensor, sigma_data: float = 0.5, sigma_min: float = 0.002
+) -> Tensor:
+    """Computes the scaling value for the residual connection.
+
+    Parameters
+    ----------
+    sigma : Tensor
+        Current standard deviation of the noise.
+    sigma_data : float, default=0.5
+        Standard deviation of the data.
+    sigma_min : float, default=0.002
+        Minimum standard deviation of the noise from the karras schedule.
+
+    Returns
+    -------
+    Tensor
+        Scaling value for the residual connection.
+    """
+    return sigma_data**2 / (sigma**2 + sigma_data**2)
+
+
 class NoiseLevelEmbedding(nn.Module):
-    def __init__(self, channels: int, scale: float = 0.02) -> None:
+    def __init__(self, channels: int, opt, scale: float = 0.02) -> None:
+
         super().__init__()
 
         self.W = nn.Parameter(torch.randn(channels // 2) * scale, requires_grad=False)
-
-        self.projection = nn.Sequential(
-            nn.Linear(channels, 4 * channels),
-            nn.SiLU(),
-            nn.Linear(4 * channels, channels),
-            Rearrange("b c -> b c () ()"),
-        )
+        if getattr(opt, "alg_diffusion_ddpm_cm_ft", False):
+            self.projection = nn.Sequential(
+                nn.Linear(channels, channels),
+                nn.SiLU(),
+                nn.Linear(channels, channels),
+                Rearrange("b c -> b c () ()"),
+            )
+        else:
+            self.projection = nn.Sequential(
+                nn.Linear(channels, 4 * channels),
+                nn.SiLU(),
+                nn.Linear(4 * channels, channels),
+                Rearrange("b c -> b c () ()"),
+            )
 
     def forward(self, x: Tensor) -> Tensor:
         h = x[:, None] * self.W[None, :] * 2 * torch.pi
@@ -235,12 +287,14 @@ class CMGenerator(nn.Module):
         sampling_method,
         image_size,
         G_ngf,
+        opt=None,
     ):
         super().__init__()
 
         self.cm_model = cm_model
         self.sampling_method = sampling_method
         self.image_size = image_size
+        self.opt = opt
 
         self.sigma_min = 0.002
         self.sigma_max = 80.0
@@ -254,9 +308,61 @@ class CMGenerator(nn.Module):
         self.lognormal_std = 2.0
 
         self.cond_embed_dim = self.cm_model.cond_embed_dim
-        self.cm_cond_embed = NoiseLevelEmbedding(self.cond_embed_dim)
+        self.cm_cond_embed = NoiseLevelEmbedding(self.cond_embed_dim, self.opt)
 
         self.current_t = 2  # default value, set from cm_model upon resume
+
+        ##ECT
+        self.P_mean = -1.1
+        self.P_std = 2.0
+        self.q = 2.0
+        self.stage = 0
+        self.k = 8.0
+        self.b = 1.0
+        self.stage = 0
+        self.current_t = 0
+        self.double_ticks = 1000
+        self.ratio = 1 - 1 / self.q ** (self.stage + 1)
+        self.t_to_r = self.t_to_r_sigmoid
+
+    def t_to_r_sigmoid(self, k, b, q, t, stage):
+        adj = 1 + k * torch.sigmoid(-b * t)
+        decay = 1 / q ** (stage + 1)
+        ratio = 1 - decay * adj
+        r = t * ratio
+        return torch.clamp(r, min=0)
+
+    def update_stage(self, cur_tick):
+        new_stage = cur_tick // self.double_ticks
+        if new_stage > self.stage:
+            self.stage = new_stage
+            self.ratio = 1 - 1 / self.q ** (self.stage + 1)
+            print(f"[ECT] Stage updated → {self.stage} | ratio={self.ratio:.6f}")
+
+    def ect_forward(self, x, sigma, sigma_data, sigma_min, x_cond=None):
+        if self.training:
+            c_skip = skip_scaling_train(sigma, sigma_data, sigma_min)
+            c_out = output_scaling_train(sigma, sigma_data, sigma_min)
+        else:  # phase=="test"
+            c_skip = skip_scaling(sigma, sigma_data, sigma_min)
+            c_out = output_scaling(sigma, sigma_data, sigma_min)
+
+        # Pad dimensions as broadcasting will not work
+        c_skip = pad_dims_like(c_skip, x)
+        c_out = pad_dims_like(c_out, x)
+
+        embed_noise_level = self.embed_sigmas(sigma)
+        if not x_cond is None:
+            if len(x.shape) != 5:
+                x_with_cond = torch.cat([x_cond, x], dim=1)
+            else:
+                x_with_cond = torch.cat([x_cond, x], dim=2)
+        else:
+            x_with_cond = x
+
+        return c_skip * x + c_out * self.cm_model(
+            x_with_cond, embed_noise_level
+        )  # , **kwargs)
 
     def cm_forward(self, x, sigma, sigma_data, sigma_min, x_cond=None):
         c_skip = skip_scaling(sigma, sigma_data, sigma_min)
@@ -268,9 +374,13 @@ class CMGenerator(nn.Module):
 
         embed_noise_level = self.embed_sigmas(sigma)
         if not x_cond is None:
-            x_with_cond = torch.cat([x_cond, x], dim=1)
+            if len(x.shape) != 5:
+                x_with_cond = torch.cat([x_cond, x], dim=1)
+            else:
+                x_with_cond = torch.cat([x_cond, x], dim=2)
         else:
             x_with_cond = x
+
         return c_skip * x + c_out * self.cm_model(
             x_with_cond, embed_noise_level
         )  # , **kwargs)
@@ -283,6 +393,54 @@ class CMGenerator(nn.Module):
         x_cond=None,
     ):
 
+        if self.opt.alg_ddpm_ft_mode == "ect":
+            rnd_normal = torch.randn(x.shape[0], device=x.device)
+            t = (rnd_normal * self.P_std + self.P_mean).exp()
+            r = self.t_to_r(self.k, self.b, self.q, t, self.stage)
+            eps = torch.randn_like(x)
+            if mask is not None:
+                mask = torch.clamp(mask, min=0.0, max=1.0)
+
+            t_noisy_x = x + pad_dims_like(t, x) * eps
+            if mask is not None:
+                t_noisy_x = t_noisy_x * mask + (1 - mask) * x
+
+            D_yt = self.ect_forward(
+                t_noisy_x,
+                t,
+                self.sigma_data,
+                self.sigma_min,
+                x_cond,
+            )
+            with torch.no_grad():
+                r_noisy_x = x + pad_dims_like(r, x) * eps
+                if mask is not None:
+                    r_noisy_x = r_noisy_x * mask + (1 - mask) * x
+
+                D_yr = self.ect_forward(
+                    r_noisy_x,
+                    r,
+                    self.sigma_data,
+                    self.sigma_min,
+                    x_cond,
+                )
+
+            bs = x.size(dim=0)
+            self.current_t += bs
+
+            print(
+                f"[ECTGenerator] Stage  is {self.stage} | ratio={self.ratio:.6f} | current_t={self.current_t} | r is {r.view(-1)} and t is {t.view(-1)}"
+            )
+
+            return (
+                D_yt,
+                D_yr,
+                t_noisy_x,
+                r_noisy_x,
+                t,
+                r,
+            )
+
         num_timesteps = improved_timesteps_schedule(
             self.current_t,
             total_training_steps,
@@ -293,7 +451,6 @@ class CMGenerator(nn.Module):
             num_timesteps, self.sigma_min, self.sigma_max, self.rho, x.device
         )
         noise = torch.randn_like(x)
-
         timesteps = lognormal_timestep_distribution(
             x.shape[0], sigmas, self.lognormal_mean, self.lognormal_std
         )
@@ -345,7 +502,6 @@ class CMGenerator(nn.Module):
         )
 
     def restoration(self, y, y_cond, sigmas, mask, clip_denoised=True):
-
         if mask is not None:
             mask = torch.clamp(
                 mask, min=0.0, max=1.0

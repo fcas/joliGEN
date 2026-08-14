@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import math
 from functools import partial
+from einops import rearrange
 
 
 def gamma_embedding_1D(gammas, dim, max_period):
@@ -76,14 +77,20 @@ def make_beta_schedule(
 
 
 def set_new_noise_schedule(model, phase):
-    to_torch = partial(torch.tensor, dtype=torch.float32)
+    param = next(model.parameters(), None)
+    if param is not None:
+        device = param.device
+    else:
+        buf = next(model.buffers(), None)
+        device = buf.device if buf is not None else torch.device("cpu")
+
+    to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
     betas = make_beta_schedule(**model.beta_schedule[phase])
     betas = betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas
     alphas = 1.0 - betas
 
     (timesteps,) = betas.shape
     setattr(model, "num_timesteps_" + phase, int(timesteps))
-
     gammas = np.cumprod(alphas, axis=0)
     gammas_prev = np.append(1.0, gammas[:-1])
 
@@ -134,3 +141,34 @@ def extract(a, t, x_shape=(1, 1, 1, 1)):
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+
+def rearrange_5dto4d_fh(*tensors):
+    """Rearrange a tensor according to a given pattern using einops.rearrange."""
+    return [rearrange(tensor, "b f c h w -> b c (f h) w") for tensor in tensors]
+
+
+def rearrange_4dto5d_fh(frame, *tensors):
+    """Rearrange a tensor from 4D to 5D according to a given pattern using einops.rearrange."""
+    return [
+        rearrange(tensor, "b c (f h) w -> b f c h w", f=frame) for tensor in tensors
+    ]
+
+
+def rearrange_5dto4d_bf(*tensors):
+    """Rearrange a tensor according to a given pattern using einops.rearrange."""
+    return [rearrange(tensor, "b f c h w -> (b f) c h w") for tensor in tensors]
+
+
+def rearrange_4dto5d_bf(frame, *tensors):
+    """Rearrange a tensor from 4D to 5D according to a given pattern using einops.rearrange."""
+    return [
+        rearrange(tensor, "(b f) c h w -> b f c h w", f=frame) for tensor in tensors
+    ]
+
+
+def expand_for_video(coeff, y_t):
+    B, T, C, H, W = y_t.shape
+    coeff = coeff.view(B, 1, 1, 1, 1)  # start as per-batch scalar
+    coeff = coeff.expand(B, T, 1, 1, 1)  # repeat along time
+    return coeff

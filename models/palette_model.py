@@ -3,7 +3,6 @@ import itertools
 import math
 import random
 import warnings
-
 import torch
 import torchvision.transforms as T
 from torch import nn
@@ -13,11 +12,17 @@ from models.modules.sam.sam_inference import compute_mask_with_sam
 from util.iter_calculator import IterCalculator
 from util.mask_generation import random_edge_mask
 from util.network_group import NetworkGroup
-
 from . import diffusion_networks
 from .base_diffusion_model import BaseDiffusionModel
 from .modules.loss import MultiScaleDiffusionLoss
 from .modules.unet_generator_attn.unet_attn_utils import revert_sync_batchnorm
+from models.modules.diffusion_utils import (
+    rearrange_5dto4d_bf,
+    rearrange_4dto5d_bf,
+    set_new_noise_schedule,
+)
+from torchvision.ops import masks_to_boxes
+import torch.nn.functional as F
 
 
 class PaletteModel(BaseDiffusionModel):
@@ -48,6 +53,31 @@ class PaletteModel(BaseDiffusionModel):
             help="use min-SNR weighting",
         )
 
+        parser.add_argument(
+            "--alg_palette_sampling_steps_test",
+            type=int,
+            default=-1,
+            help="Number of sampling steps to use during the test phase in training. This functions the same as 'sampling_steps' used for DDIM inference.",
+        )
+
+        parser.add_argument(
+            "--alg_palette_sampling_method_test",
+            type=str,
+            default="ddpm",
+            help="Sampling method to use during the test phase in training. Equivalent to 'sampling_method' in inference.",
+        )
+
+        parser.add_argument(
+            "--alg_palette_autoregressive",
+            action="store_true",
+            help="Autoregressive training: each batch is either all canny edges(noisy image) or one full image with others black.",
+        )
+
+        parser.add_argument(
+            "--alg_palette_metric_mask",
+            action="store_true",
+            help="Evaluate the metric PSNR and SSIM on the dilated mask region instead of the cropped image.",
+        )
         if is_train:
             parser = PaletteModel.modify_commandline_options_train(parser)
 
@@ -104,7 +134,16 @@ class PaletteModel(BaseDiffusionModel):
         else:
             batch_size = self.opt.test_batch_size
 
-        max_visual_outputs = max(self.opt.train_batch_size, self.opt.num_test_images)
+        if opt.isTrain:
+            max_visual_outputs = min(
+                max(self.opt.train_batch_size, self.opt.num_test_images),
+                self.opt.output_num_images,
+            )
+
+            if self.opt.G_netG == "unet_vid":
+                max_visual_outputs = (
+                    self.opt.train_batch_size * self.opt.data_temporal_number_frames
+                )
 
         self.num_classes = max(
             self.opt.f_s_semantic_nclasses, self.opt.cls_semantic_nclasses
@@ -139,9 +178,10 @@ class PaletteModel(BaseDiffusionModel):
                 self.gen_visual_names.append("output_" + str(i + 1) + "_")
 
         elif self.use_ref:
-            for i in range(max_visual_outputs):
-                self.gen_visual_names.append("ref_" + str(i + 1) + "_")
-                self.gen_visual_names.append("output_" + str(i + 1) + "_")
+            if opt.isTrain:
+                for i in range(max_visual_outputs):
+                    self.gen_visual_names.append("ref_" + str(i + 1) + "_")
+                    self.gen_visual_names.append("output_" + str(i + 1) + "_")
 
         else:
             self.gen_visual_names.append("output_")
@@ -149,8 +189,11 @@ class PaletteModel(BaseDiffusionModel):
         if self.opt.alg_diffusion_cond_image_creation == "previous_frame":
             self.gen_visual_names.insert(0, "previous_frame_")
 
-        for k in range(max_visual_outputs):
-            self.visual_names.append([temp + str(k) for temp in self.gen_visual_names])
+        if opt.isTrain:
+            for k in range(max_visual_outputs):
+                self.visual_names.append(
+                    [temp + str(k) for temp in self.gen_visual_names]
+                )
 
         self.visual_names.append(visual_outputs)
 
@@ -248,8 +291,13 @@ class PaletteModel(BaseDiffusionModel):
             len(data["A"].to(self.device).shape) == 5
         ):  # we're using temporal successive frames
             self.previous_frame = data["A"].to(self.device)[:, 0]
-            self.y_t = data["A"].to(self.device)[:, 1]
-            self.gt_image = data["B"].to(self.device)[:, 1]
+            if self.opt.G_netG == "unet_vid":
+                self.y_t = data["A"].to(self.device)
+                self.gt_image = data["B"].to(self.device)
+
+            else:
+                self.y_t = data["A"].to(self.device)[:, 1]
+                self.gt_image = data["B"].to(self.device)[:, 1]
             if self.task == "inpainting":
                 self.previous_frame_mask = data["B_label_mask"].to(self.device)[:, 0]
                 ### Note: the sam related stuff should eventually go into the dataloader
@@ -275,7 +323,10 @@ class PaletteModel(BaseDiffusionModel):
                         self.mask[self.mask == 2] = 0
                     self.y_t = fill_mask_with_random(self.gt_image, self.mask, -1)
                 else:
-                    self.mask = data["B_label_mask"].to(self.device)[:, 1]
+                    if self.opt.G_netG == "unet_vid":
+                        self.mask = data["B_label_mask"].to(self.device)
+                    else:
+                        self.mask = data["B_label_mask"].to(self.device)[:, 1]
             else:
                 self.mask = None
         else:
@@ -321,9 +372,44 @@ class PaletteModel(BaseDiffusionModel):
 
         if self.use_ref:
             self.ref_A = data["ref_A"].to(self.device)
-
         if self.opt.alg_diffusion_cond_image_creation == "y_t":
             self.cond_image = self.y_t
+            if self.opt.alg_palette_autoregressive and self.opt.G_netG == "unet_vid":
+                if (
+                    self.opt.alg_palette_autoregressive
+                    and self.opt.G_netG == "unet_vid"
+                ):
+                    B, T, C, H, W = self.cond_image.shape
+                    k_ctx = T // 2
+                    if k_ctx > 0:
+                        # Sample ONE noise level per sequence (applies to all context frames)
+                        num_buckets = 10
+                        max_sigma = 0.7
+                        bucket_idx = torch.randint(
+                            0, num_buckets, (B,), device=self.device
+                        )
+                        sigma_values = (
+                            bucket_idx.float() / (num_buckets - 1) * max_sigma
+                        )
+                        sigma = sigma_values.view(B, 1, 1, 1)
+                        eps_ctx = torch.randn(B, 1, C, H, W, device=self.device).expand(
+                            B, k_ctx, C, H, W
+                        )
+
+                        noise_prob = 0.9
+                        if torch.rand(1).item() < noise_prob:
+                            gt_ctx = self.gt_image[:, :k_ctx]
+                            mask_ctx = self.mask[:, :k_ctx]
+                            mask_ctx = mask_ctx > 0.5
+                            mask_ctx = mask_ctx.expand(-1, -1, gt_ctx.shape[2], -1, -1)
+                            noise = sigma.unsqueeze(1) * eps_ctx
+                            noisy_gt_ctx = gt_ctx + noise * mask_ctx
+                            cond_image_mix = self.cond_image.clone()
+                            cond_image_mix[:, :k_ctx] = noisy_gt_ctx
+                            self.cond_image = cond_image_mix
+                    else:
+                        pass
+
         elif self.opt.alg_diffusion_cond_image_creation == "previous_frame":
             cond_image_list = []
 
@@ -357,8 +443,8 @@ class PaletteModel(BaseDiffusionModel):
                         batch_cond_image = fill_img_with_random_sketch(
                             image.unsqueeze(0),
                             mask.unsqueeze(0),
-                            low_threshold_random=low,
-                            high_threshold_random=high,
+                            cur_low_threshold_random=low,
+                            cur_high_threshold_random=high,
                         ).squeeze(0)
                     elif "sam" in fill_img_with_random_sketch.__name__:
                         batch_cond_image = fill_img_with_random_sketch(
@@ -381,12 +467,68 @@ class PaletteModel(BaseDiffusionModel):
                 if "canny" in fill_img_with_random_sketch.__name__:
                     low = min(self.opt.alg_diffusion_cond_sketch_canny_range)
                     high = max(self.opt.alg_diffusion_cond_sketch_canny_range)
+                    if (
+                        self.opt.G_netG == "unet_vid"
+                        and self.opt.alg_diffusion_cond_image_creation
+                        == "computed_sketch"
+                    ):
+                        self.mask, self.gt_image = rearrange_5dto4d_bf(
+                            self.mask, self.gt_image
+                        )
+
+                    random_num = torch.rand(self.gt_image.shape[0])
+                    dropout_pro = torch.empty(self.gt_image.shape[0]).uniform_(
+                        self.opt.alg_diffusion_vid_canny_dropout[0][0],
+                        self.opt.alg_diffusion_vid_canny_dropout[1][0],
+                    )
+                    canny_frame = (random_num > dropout_pro).int()  # binary canny_frame
                     self.cond_image = fill_img_with_random_sketch(
                         self.gt_image,
                         self.mask,
                         low_threshold_random=low,
                         high_threshold_random=high,
+                        select_canny=canny_frame,
                     )
+                    self.cond_image_black = fill_img_with_random_sketch(
+                        self.gt_image,
+                        self.mask,
+                        low_threshold_random=low,
+                        high_threshold_random=high,
+                        select_canny=len(canny_frame) * [0],
+                    )
+                    if (
+                        self.opt.G_netG == "unet_vid"
+                        and self.opt.alg_diffusion_cond_image_creation
+                        == "computed_sketch"
+                    ):
+                        (
+                            self.mask,
+                            self.gt_image,
+                            self.cond_image,
+                            self.cond_image_black,
+                        ) = rearrange_4dto5d_bf(
+                            self.opt.data_temporal_number_frames,
+                            self.mask,
+                            self.gt_image,
+                            self.cond_image,
+                            self.cond_image_black,
+                        )
+                        B, T = self.cond_image.size(0), self.cond_image.size(1)
+                        if self.opt.alg_palette_autoregressive:
+                            gt_image_mix = self.cond_image_black.clone()
+                            idx = torch.randint(
+                                0, T, (B,), device=self.device
+                            )  # one frame per batch
+                            batch_idx = torch.arange(B, device=self.device)
+                            gt_image_mix[batch_idx, idx] = self.gt_image[batch_idx, idx]
+
+                            use_gt_mix = (
+                                torch.rand(B, 1, 1, 1, 1, device=self.device) < 0.07
+                            )
+
+                            self.cond_image = torch.where(
+                                use_gt_mix, gt_image_mix, self.cond_image
+                            )
                 elif "sam" in fill_img_with_random_sketch.__name__:
                     self.cond_image = fill_img_with_random_sketch(
                         self.gt_image,
@@ -445,10 +587,13 @@ class PaletteModel(BaseDiffusionModel):
             ref = self.ref_A
         else:
             ref = None
-
         noise, noise_hat, min_snr_loss_weight = self.netG_A(
             y_0=y_0, y_cond=y_cond, noise=noise, mask=mask, cls=cls, ref=ref
         )
+        frame = 0
+        if len(y_0.shape) == 5:
+            frame = y_0.shape[1]
+
         if not self.opt.alg_palette_minsnr:
             min_snr_loss_weight = 1.0
 
@@ -475,10 +620,31 @@ class PaletteModel(BaseDiffusionModel):
         self.loss_G_tot = self.opt.alg_diffusion_lambda_G * loss
 
     def inference(self, nb_imgs, offset=0):
+
         if hasattr(self.netG_A, "module"):
             netG = self.netG_A.module
         else:
             netG = self.netG_A
+
+        original_sampling_method = netG.sampling_method
+        original_timestep = netG.denoise_fn.model.num_timesteps_test
+        schedule_changed = False
+        if (
+            hasattr(self.opt, "alg_palette_sampling_steps_test")
+            and self.opt.alg_palette_sampling_steps_test > 0
+        ):
+            if (
+                netG.denoise_fn.model.num_timesteps_test
+                != self.opt.alg_palette_sampling_steps_test
+            ):
+                netG.denoise_fn.model.beta_schedule["test"][
+                    "n_timestep"
+                ] = self.opt.alg_palette_sampling_steps_test
+                set_new_noise_schedule(netG.denoise_fn.model, "test")
+                schedule_changed = True
+
+        if hasattr(self.opt, "alg_palette_sampling_method_test"):
+            netG.set_new_sampling_method(self.opt.alg_palette_sampling_method_test)
 
         if len(self.opt.gpu_ids) > 1 and self.opt.G_unet_mha_norm_layer == "batchnorm":
             netG = revert_sync_batchnorm(netG)
@@ -592,8 +758,82 @@ class PaletteModel(BaseDiffusionModel):
                     ddim_num_steps=self.ddim_num_steps,
                     ddim_eta=self.ddim_eta,
                 )
-                self.fake_B = self.output
+                ## dilated_mask metric
+                if self.opt.alg_palette_metric_mask:
+                    if self.opt.G_netG == "unet_vid":
+                        B, T, C, H, W = mask.shape
+                        (mask_4d,) = rearrange_5dto4d_bf(mask)
+                        dilation = 3
+                        dilated_mask_4d = F.max_pool2d(
+                            mask_4d.float(),
+                            kernel_size=2 * dilation + 1,
+                            stride=1,
+                            padding=dilation,
+                        )
+                        dilated_mask_4d = (dilated_mask_4d > 0.5).float()
+                        (dilated_mask,) = rearrange_4dto5d_bf(T, dilated_mask_4d)
 
+                        dm = dilated_mask.expand_as(self.output)
+                        fake_B_dilated = self.output * dm
+                        gt_image_dilated = self.gt_image * dm
+
+                        B, T, _, H, W = dilated_mask.shape
+                        boxes = masks_to_boxes(dilated_mask.view(-1, H, W)).int()
+
+                        fake_crops = [
+                            [
+                                fake_B_dilated[b, t, :, y0:y1, x0:x1]
+                                for t, (x0, y0, x1, y1) in enumerate(
+                                    boxes[b * T : (b + 1) * T]
+                                )
+                            ]
+                            for b in range(B)
+                        ]
+
+                        gt_crops = [
+                            [
+                                gt_image_dilated[b, t, :, y0:y1, x0:x1]
+                                for t, (x0, y0, x1, y1) in enumerate(
+                                    boxes[b * T : (b + 1) * T]
+                                )
+                            ]
+                            for b in range(B)
+                        ]
+
+                        self.fake_B_dilated = fake_crops
+                        self.gt_image_dilated = gt_crops
+                    else:
+                        B, C, H, W = mask.shape
+                        mask_4d = mask
+
+                        dilation = 3
+                        dilated_mask_4d = F.max_pool2d(
+                            mask_4d.float(),
+                            kernel_size=2 * dilation + 1,
+                            stride=1,
+                            padding=dilation,
+                        )
+                        dilated_mask_4d = (dilated_mask_4d > 0.5).float()
+
+                        dm = dilated_mask_4d.expand_as(self.output)
+                        fake_B_dilated = self.output * dm
+                        gt_image_dilated = self.gt_image * dm
+
+                        boxes = masks_to_boxes(dilated_mask_4d.squeeze(1)).int()
+                        fake_crops = [
+                            fake_B_dilated[b, :, y0:y1, x0:x1]
+                            for b, (x0, y0, x1, y1) in enumerate(boxes)
+                        ]
+                        gt_crops = [
+                            gt_image_dilated[b, :, y0:y1, x0:x1]
+                            for b, (x0, y0, x1, y1) in enumerate(boxes)
+                        ]
+
+                        self.fake_B_dilated = fake_crops
+                        self.gt_image_dilated = gt_crops
+
+                self.fake_B = self.output
+                self.visuals = self.output
         # task: super resolution, pix2pix
         elif self.task in ["super_resolution", "pix2pix"]:
             self.output, self.visuals = netG.restoration(
@@ -609,20 +849,42 @@ class PaletteModel(BaseDiffusionModel):
                 y_cond=self.cond_image[:nb_imgs], sample_num=self.sample_num
             )
 
-        for name in self.gen_visual_names:
-            whole_tensor = getattr(self, name[:-1])  # i.e. self.output, ...
+        if not self.opt.G_netG == "unet_vid":
+            for name in self.gen_visual_names:
+                whole_tensor = getattr(self, name[:-1])  # i.e. self.output, ...
+                for k in range(min(nb_imgs, self.get_current_batch_size())):
+                    cur_name = name + str(offset + k)
+                    cur_tensor = whole_tensor[k : k + 1]
+                    if "mask" in name:
+                        cur_tensor = cur_tensor.squeeze(0)
+                    setattr(self, cur_name, cur_tensor)
             for k in range(min(nb_imgs, self.get_current_batch_size())):
-                cur_name = name + str(offset + k)
-                cur_tensor = whole_tensor[k : k + 1]
-                if "mask" in name:
-                    cur_tensor = cur_tensor.squeeze(0)
-                setattr(self, cur_name, cur_tensor)
-
-        for k in range(min(nb_imgs, self.get_current_batch_size())):
-            self.fake_B_pool.query(self.visuals[k : k + 1])
-
+                self.fake_B_pool.query(self.visuals[k : k + 1])
+        else:
+            for name in self.gen_visual_names:
+                whole_tensor = getattr(self, name[:-1])  # i.e. self.output, ...
+                for bs in range(min(nb_imgs, self.get_current_batch_size())):
+                    for k in range(self.opt.data_temporal_number_frames):
+                        cur_name = name + str(
+                            offset + bs * (self.opt.data_temporal_number_frames) + k
+                        )
+                        cur_tensor = whole_tensor[bs, k, :, :, :].unsqueeze(0)
+                        if "mask" in name:
+                            cur_tensor = cur_tensor.squeeze(0)
+                        setattr(self, cur_name, cur_tensor)
+            for k in range(min(nb_imgs, self.get_current_batch_size())):
+                self.fake_B_pool.query(self.visuals[k : k + 1, :, :, :, :])
         if len(self.opt.gpu_ids) > 1 and self.opt.G_unet_mha_norm_layer == "batchnorm":
             netG = torch.nn.SyncBatchNorm.convert_sync_batchnorm(netG)
+
+        if hasattr(self.opt, "alg_palette_sampling_method_test"):
+            netG.set_new_sampling_method(original_sampling_method)
+
+        if schedule_changed:
+            netG.denoise_fn.model.beta_schedule["test"][
+                "n_timestep"
+            ] = original_timestep
+            set_new_noise_schedule(netG.denoise_fn.model, "test")
 
     def compute_visuals(self, nb_imgs):
         super().compute_visuals(nb_imgs)

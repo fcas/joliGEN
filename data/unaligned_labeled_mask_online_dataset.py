@@ -11,7 +11,14 @@ from PIL import Image
 from data.base_dataset import BaseDataset, get_transform, get_transform_seg
 from data.utils import load_image
 from data.image_folder import make_dataset, make_dataset_path, make_labeled_path_dataset
-from data.online_creation import crop_image
+from data.online_creation import (
+    build_instance_mask_from_crop_meta,
+    crop_image,
+    mask_prediction_enabled,
+    randomize_instance_mask,
+    sample_mask_precision_state,
+    sample_online_pre_crop_rotation_state,
+)
 
 
 class UnalignedLabeledMaskOnlineDataset(BaseDataset):
@@ -91,28 +98,61 @@ class UnalignedLabeledMaskOnlineDataset(BaseDataset):
     ):
         # Domain A
         try:
+            predict_mask = mask_prediction_enabled(self.opt)
+            rotation_state_A = sample_online_pre_crop_rotation_state(self.opt)
             if self.opt.data_online_creation_mask_delta_A_ratio == [[]]:
                 mask_delta_A = self.opt.data_online_creation_mask_delta_A
             else:
                 mask_delta_A = self.opt.data_online_creation_mask_delta_A_ratio
 
-            A_img, A_label_mask, A_ref_bbox, A_ref_bbox_id = crop_image(
+            crop_result = crop_image(
                 A_img_path,
                 A_label_mask_path,
                 mask_delta=mask_delta_A,
                 mask_random_offset=self.opt.data_online_creation_mask_random_offset_A,
                 crop_delta=self.opt.data_online_creation_crop_delta_A,
                 mask_square=self.opt.data_online_creation_mask_square_A,
+                broaden_rect_aug=getattr(
+                    self.opt, "data_online_creation_mask_broaden_rect_aug_A", False
+                ),
                 crop_dim=self.opt.data_online_creation_crop_size_A,
                 output_dim=self.opt.data_load_size,
                 context_pixels=self.opt.data_online_context_pixels,
                 load_size=self.opt.data_online_creation_load_size_A,
+                load_size_keep_ratio=getattr(
+                    self.opt, "data_online_creation_load_size_keep_ratio_A", False
+                ),
                 select_cat=self.opt.data_online_select_category,
                 fixed_mask_size=self.opt.data_online_fixed_mask_size,
+                fixed_mask_size_model=getattr(
+                    self.opt, "data_online_creation_mask_fixed_size_A", -1
+                ),
+                fixed_mask_min_unmasked_border_model=getattr(
+                    self.opt, "data_online_creation_mask_min_unmasked_border_A", 4
+                ),
                 inverted_mask=self.opt.data_inverted_mask,
                 single_bbox=self.opt.data_online_single_bbox,
                 random_bbox=self.opt.data_online_random_bbox,
+                return_meta=predict_mask,
+                rotation_state=rotation_state_A,
             )
+
+            if predict_mask:
+                (
+                    A_img,
+                    A_label_mask,
+                    A_ref_bbox,
+                    A_ref_bbox_id,
+                    A_crop_meta,
+                ) = crop_result
+                A_instance_mask = build_instance_mask_from_crop_meta(
+                    A_label_mask_path,
+                    A_crop_meta,
+                    self.opt.data_load_size,
+                    self.opt.data_online_context_pixels,
+                )
+            else:
+                A_img, A_label_mask, A_ref_bbox, A_ref_bbox_id = crop_result
 
             self.cat_A_ref_bbox = torch.tensor(A_ref_bbox[0])
             A_ref_bbox = A_ref_bbox[1:]
@@ -121,7 +161,27 @@ class UnalignedLabeledMaskOnlineDataset(BaseDataset):
             print(e, "domain A data loading for ", A_img_path)
             return None
 
-        A, A_label_mask, A_ref_bbox = self.transform(A_img, A_label_mask, A_ref_bbox)
+        if predict_mask:
+            A, A_instance_mask, A_ref_bbox = self.transform(
+                A_img, A_instance_mask, A_ref_bbox
+            )
+            A_instance_mask = (A_instance_mask > 0).float()
+            precision_state = sample_mask_precision_state(self.opt)
+            (
+                A_label_mask,
+                A_mandatory_mask,
+                A_mask_precision_mode,
+                A_mask_precision_severity,
+            ) = randomize_instance_mask(
+                A_instance_mask,
+                precision_state,
+                self.opt,
+                self.cat_A_ref_bbox,
+            )
+        else:
+            A, A_label_mask, A_ref_bbox = self.transform(
+                A_img, A_label_mask, A_ref_bbox
+            )
 
         if clamp_semantics and torch.any(A_label_mask > self.semantic_nclasses - 1):
             warnings.warn(
@@ -139,39 +199,109 @@ class UnalignedLabeledMaskOnlineDataset(BaseDataset):
             "A_ref_bbox": A_ref_bbox,
             "A_ref_bbox_id": A_ref_bbox_id,
         }
+        if predict_mask:
+            result.update(
+                {
+                    "A_source": A.clone(),
+                    "A_instance_mask": A_instance_mask,
+                    "A_mandatory_mask": A_mandatory_mask,
+                    "A_mask_precision_mode": torch.tensor(
+                        A_mask_precision_mode, dtype=torch.long
+                    ),
+                    "A_mask_precision_severity": torch.tensor(
+                        A_mask_precision_severity, dtype=torch.float32
+                    ),
+                }
+            )
 
         # Domain B
         if B_img_path is not None:
             try:
+                rotation_state_B = sample_online_pre_crop_rotation_state(self.opt)
                 if self.opt.data_online_creation_mask_delta_B_ratio == [[]]:
                     mask_delta_B = self.opt.data_online_creation_mask_delta_B
                 else:
                     mask_delta_B = self.opt.data_online_creation_mask_delta_B_ratio
 
                 if B_label_mask_path is not None:
-                    B_img, B_label_mask, B_ref_bbox, B_ref_bbox_id = crop_image(
+                    crop_result = crop_image(
                         B_img_path,
                         B_label_mask_path,
                         mask_delta=mask_delta_B,
                         mask_random_offset=self.opt.data_online_creation_mask_random_offset_B,
                         crop_delta=self.opt.data_online_creation_crop_delta_B,
                         mask_square=self.opt.data_online_creation_mask_square_B,
+                        broaden_rect_aug=getattr(
+                            self.opt,
+                            "data_online_creation_mask_broaden_rect_aug_B",
+                            False,
+                        ),
                         crop_dim=self.opt.data_online_creation_crop_size_B,
                         output_dim=self.opt.data_load_size,
                         context_pixels=self.opt.data_online_context_pixels,
                         load_size=self.opt.data_online_creation_load_size_B,
+                        load_size_keep_ratio=getattr(
+                            self.opt,
+                            "data_online_creation_load_size_keep_ratio_B",
+                            False,
+                        ),
                         fixed_mask_size=self.opt.data_online_fixed_mask_size,
+                        fixed_mask_size_model=getattr(
+                            self.opt, "data_online_creation_mask_fixed_size_B", -1
+                        ),
+                        fixed_mask_min_unmasked_border_model=getattr(
+                            self.opt,
+                            "data_online_creation_mask_min_unmasked_border_B",
+                            4,
+                        ),
                         inverted_mask=self.opt.data_inverted_mask,
                         single_bbox=self.opt.data_online_single_bbox,
                         random_bbox=self.opt.data_online_random_bbox,
+                        return_meta=predict_mask,
+                        rotation_state=rotation_state_B,
                     )
+
+                    if predict_mask:
+                        (
+                            B_img,
+                            B_label_mask,
+                            B_ref_bbox,
+                            B_ref_bbox_id,
+                            B_crop_meta,
+                        ) = crop_result
+                        B_instance_mask = build_instance_mask_from_crop_meta(
+                            B_label_mask_path,
+                            B_crop_meta,
+                            self.opt.data_load_size,
+                            self.opt.data_online_context_pixels,
+                        )
+                    else:
+                        B_img, B_label_mask, B_ref_bbox, B_ref_bbox_id = crop_result
 
                     self.cat_B_ref_bbox = torch.tensor(B_ref_bbox[0])
                     B_ref_bbox = B_ref_bbox[1:]
 
-                    B, B_label_mask, B_ref_bbox = self.transform(
-                        B_img, B_label_mask, B_ref_bbox
-                    )
+                    if predict_mask:
+                        B, B_instance_mask, B_ref_bbox = self.transform(
+                            B_img, B_instance_mask, B_ref_bbox
+                        )
+                        B_instance_mask = (B_instance_mask > 0).float()
+                        precision_state = sample_mask_precision_state(self.opt)
+                        (
+                            B_label_mask,
+                            B_mandatory_mask,
+                            B_mask_precision_mode,
+                            B_mask_precision_severity,
+                        ) = randomize_instance_mask(
+                            B_instance_mask,
+                            precision_state,
+                            self.opt,
+                            self.cat_B_ref_bbox,
+                        )
+                    else:
+                        B, B_label_mask, B_ref_bbox = self.transform(
+                            B_img, B_label_mask, B_ref_bbox
+                        )
 
                     if clamp_semantics and torch.any(
                         B_label_mask > self.semantic_nclasses - 1
@@ -209,6 +339,20 @@ class UnalignedLabeledMaskOnlineDataset(BaseDataset):
                         "B_ref_bbox_id": B_ref_bbox_id,
                     }
                 )
+                if predict_mask:
+                    result.update(
+                        {
+                            "B_source": B.clone(),
+                            "B_instance_mask": B_instance_mask,
+                            "B_mandatory_mask": B_mandatory_mask,
+                            "B_mask_precision_mode": torch.tensor(
+                                B_mask_precision_mode, dtype=torch.long
+                            ),
+                            "B_mask_precision_severity": torch.tensor(
+                                B_mask_precision_severity, dtype=torch.float32
+                            ),
+                        }
+                    )
 
         return result
 

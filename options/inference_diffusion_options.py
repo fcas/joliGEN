@@ -15,6 +15,11 @@ class InferenceDiffusionOptions(BaseOptions):
             required=True,
         )
 
+        parser.add_argument(
+            "--paths_in_file",
+            help="frames and bbox pairwise file path for the video generation(.txt file)",
+            required=False,
+        )
         parser.add_argument("--img_in", help="image to transform", required=True)
         parser.add_argument(
             "--dir_out",
@@ -273,6 +278,32 @@ class InferenceDiffusionOptions(BaseOptions):
             "--data_refined_mask",
             action="store_true",
             help="whether to use refined mask with sam",
+        )
+        parser.add_argument(
+            "--vid_frame_extension_number",
+            type=int,
+            default=0,
+            help="additional sequence number added during the inference",
+        )
+        parser.add_argument(
+            "--alg_sc_denoise_inferstep",
+            type=int,
+            default=1,
+            help="denoise steps during the inference time",
+        )
+
+        parser.add_argument(
+            "--alg_b2b_denoise_timesteps",
+            type=int,
+            default=1,
+            help="denoise steps during the inference time",
+        )
+
+        parser.add_argument(
+            "--vid_fps",
+            type=float,
+            default=18,
+            help="fps during the inference video generation",
         )
 
         self.isTrain = False

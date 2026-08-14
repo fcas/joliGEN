@@ -7,7 +7,6 @@ import torch.nn.functional as F
 
 import numpy as np
 
-from einops import rearrange
 from einops.layers.torch import Rearrange
 
 from positional_encodings.torch_encodings import PositionalEncoding1D, Summer
@@ -264,7 +263,7 @@ class ResBlock(EmbedBlock):
         skipw = 1.0
         if self.efficient:
             skipw = 1.0 / math.sqrt(2)
-        return self.skip_connection(x) + h
+        return skipw * self.skip_connection(x) + h
 
 
 class AttentionBlock(nn.Module):

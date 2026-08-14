@@ -58,7 +58,6 @@ class BaseOptions:
 
         # get the basic options
         opt = self._parse_args(parser, None, args, flat_json)
-
         # get specific options
         opt, parser = self._gather_specific_options(opt, parser, args, flat_json)
 
@@ -93,6 +92,7 @@ class BaseOptions:
                         % (len(flat_json), ",".join(flat_json.keys()))
                     )  # it's not an error anymore because server launching is done with all of the options even those from other models, raising an error will lead to a server crash
         else:
+            # do not ignore unknown options here, they are actual errors in the command line
             if only_known:
                 opt, _ = parser.parse_known_args(args)
             else:
@@ -370,9 +370,14 @@ class BaseOptions:
             if "title" in schema_tmplate:
                 schema["title"] = schema_tmplate["title"]
             if "properties" in schema_tmplate:
+                if "properties" not in schema:
+                    schema["properties"] = {}
                 for prop in schema_tmplate["properties"]:
+                    child_json_vals = json_vals.get(prop, {})
+                    if not isinstance(child_json_vals, dict):
+                        child_json_vals = {}
                     schema["properties"][prop] = json_to_schema(
-                        prop, json_vals[prop], schema_tmplate["properties"][prop]
+                        prop, child_json_vals, schema_tmplate["properties"][prop]
                     )
 
             return schema

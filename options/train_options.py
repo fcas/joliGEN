@@ -120,6 +120,12 @@ class TrainOptions(CommonOptions):
             help="if True x - G(x) is displayed",
         )
         parser.add_argument("--output_display_G_attention_masks", action="store_true")
+        parser.add_argument(
+            "--output_num_images",
+            type=int,
+            default=20,
+            help="number of visualized images results from the train/test set",
+        )
 
         # network saving and loading parameters
         parser.add_argument(
@@ -152,10 +158,26 @@ class TrainOptions(CommonOptions):
             help="continue training: load the latest model",
         )
         parser.add_argument(
+            "--train_continue_from",
+            type=str,
+            default="",
+            help=(
+                "initialize this new training run from another checkpoint directory "
+                "without resuming logs or epoch counters"
+            ),
+        )
+
+        parser.add_argument(
             "--train_epoch_count",
             type=int,
             default=1,
             help="the starting epoch count, we save the model by <epoch_count>, <epoch_count>+<save_latest_freq>, ...",
+        )
+
+        parser.add_argument(
+            "--train_finetune",
+            action="store_true",
+            help="sets the models into finetune mode, i.e. less checks are applied, e.g. whether a network already exists, to be used in combination with --train_continue",
         )
 
         # training parameters
@@ -214,7 +236,7 @@ class TrainOptions(CommonOptions):
             type=str,
             default=["FID"],
             nargs="*",
-            choices=["FID", "KID", "MSID", "PSNR", "LPIPS", "SSIM"],
+            choices=["FID", "KID", "MSID", "PSNR", "LPIPS", "SSIM", "DINOv2", "FVD"],
             help="metrics on results quality to compute",
         )
         parser.add_argument(
@@ -254,7 +276,7 @@ class TrainOptions(CommonOptions):
         parser.add_argument(
             "--train_n_epochs_decay",
             type=int,
-            default=100,
+            default=0,
             help="number of epochs to linearly decay learning rate to zero",
         )
         parser.add_argument(
@@ -292,7 +314,7 @@ class TrainOptions(CommonOptions):
             "--train_lr_policy",
             type=str,
             default="linear",
-            choices=["linear", "step", "plateau", "cosine"],
+            choices=["linear", "step", "multistep", "plateau", "cosine"],
             help="learning rate policy.",
         )
         parser.add_argument(
@@ -301,6 +323,14 @@ class TrainOptions(CommonOptions):
             default=50,
             help="multiply by a gamma every lr_decay_iters iterations",
         )
+        parser.add_argument(
+            "--train_lr_steps",
+            default=[],
+            nargs="*",
+            type=int,
+            help="number of epochs between reductions of the learning rate by gamma=0.1",
+        )
+
         parser.add_argument(
             "--train_nb_img_max_fid",
             type=int,
@@ -578,7 +608,7 @@ class TrainOptions(CommonOptions):
             "--dataaug_diff_aug_policy",
             type=str,
             default="",
-            help="choose the augmentation policy : color randaffine randperspective. If you want more than one, please write them separated by a comma with no space (e.g. color,randaffine)",
+            help="choose the augmentation policy : color wild color+wild randaffine randperspective. If you want more than one, please write them separated by a comma with no space (e.g. color,randaffine)",
         )
         parser.add_argument(
             "--dataaug_diff_aug_proba",
@@ -661,6 +691,11 @@ class TrainOptions(CommonOptions):
     def _after_parse(self, opt, set_device=True):
         opt = super()._after_parse(opt=opt, set_device=set_device)
 
+        if opt.train_continue and opt.train_continue_from:
+            raise ValueError(
+                "--train_continue and --train_continue_from are mutually exclusive"
+            )
+
         # process opt.suffix
         if opt.suffix:
             suffix = ("_" + opt.suffix.format(**vars(opt))) if opt.suffix != "" else ""
@@ -694,7 +729,7 @@ class TrainOptions(CommonOptions):
             )
 
         # vitclip16 projector only works with input size 224
-        if opt.D_proj_network_type == "efficientnet":
+        if "projected_d" in opt.D_netDs and opt.D_proj_network_type == "efficientnet":
             if opt.D_proj_interp < 224:
                 warnings.warn(
                     "Efficiennet projector has minimal input size of 224, setting D_proj_interp to 224"

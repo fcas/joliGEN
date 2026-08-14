@@ -8,8 +8,10 @@ import sys
 import numpy as np
 import requests
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
+from piq import psnr, ssim
 
 
 def display_mask(mask):
@@ -148,7 +150,7 @@ def display_mask(mask):
     mask_dis = np.zeros((mask.shape[0], mask.shape[1], 3))
     # print('mask_dis shape',mask_dis.shape)
     for i in range(mask.shape[0]):
-        for j in range(mask.shape[0]):
+        for j in range(mask.shape[1]):
             cls_display = mask[i, j] % nb_cls_display
             mask_dis[i, j, :] = dict_col[cls_display]
     return mask_dis
@@ -340,3 +342,58 @@ def pairs_of_floats(arg):
 
 def pairs_of_ints(arg):
     return [int(x) for x in arg.split(",")]
+
+
+def rgbn_float_img_to_8bits_display(rgbn_img, gamma: float = 1.0):
+    """
+    rgbn float (0.,1.) to rgb 8bits + ngb 8bits
+    """
+    rgb_img = rgbn_img[:, :, [0, 1, 2]]
+    if gamma != 1:
+        rgb_img = rgb_img**gamma
+
+    rgb_img = (rgb_img.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+
+    nrg_img = rgbn_img[:, :, [3, 0, 1]]
+    if gamma != 1:
+        nrg_img = nrg_img**gamma
+
+    nrg_img = (nrg_img.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+
+    return rgb_img, nrg_img
+
+
+def img_12bits_to_float(img: np.ndarray) -> np.ndarray:
+    """
+    convert img to np.float32 [0,1.]
+    """
+    img = img.astype(np.float32) / 4095.0
+
+    return img
+
+
+def pan_float_img_to_8bits_display(img, gamma=0.7):
+    """
+    float (0.,1.) to 8bits
+    optionnal gamma transform
+    """
+    if gamma != 1:
+        img = img**gamma
+
+    return (img.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def pad_to_lpips_safe(img, min_size=64):
+    h, w = img.shape[-2:]
+
+    pad_h_needed = max(0, min_size - h)
+    pad_w_needed = max(0, min_size - w)
+
+    pad_h_top = pad_h_needed // 2
+    pad_h_bottom = pad_h_needed - pad_h_top
+
+    pad_w_left = pad_w_needed // 2
+    pad_w_right = pad_w_needed - pad_w_left
+
+    pad = (pad_w_left, pad_w_right, pad_h_top, pad_h_bottom)
+    return F.pad(img, pad, mode="constant", value=0)

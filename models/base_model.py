@@ -1,5 +1,8 @@
+import cv2
+from util.fvd import FrechetVideoDistance
 import copy
 import os
+import math
 
 import torch
 
@@ -23,8 +26,9 @@ from tqdm import tqdm
 from piq import MSID, KID, FID, psnr, ssim
 from lpips import LPIPS
 
+from util.dino_metric import DINOv2Metric
 from util.util import save_image, tensor2im, delete_flop_param
-
+from util.util import pad_to_lpips_safe
 
 from util.diff_aug import DiffAugment
 from util.discriminator import DiscriminatorInfo
@@ -46,6 +50,8 @@ from . import base_networks, semantic_networks
 from .modules import loss
 from .modules.utils import get_scheduler
 from .modules.sam.sam_inference import predict_sam
+from .modules.diffusion_utils import rearrange_5dto4d_bf
+import logging
 
 
 class BaseModel(ABC):
@@ -147,6 +153,10 @@ class BaseModel(ABC):
             self.kid_metric = KID()
         if "LPIPS" in self.opt.train_metrics_list:
             self.lpips_metric = LPIPS().to(self.device)
+        if "DINOv2" in self.opt.train_metrics_list:
+            self.dinov2_metric = DINOv2Metric().to(self.device)
+        if "FVD" in self.opt.train_metrics_list:
+            self.fvd_metric = FrechetVideoDistance()
 
     def init_metrics(self, dataloader_test, test_name=""):
         self.use_inception = any(
@@ -386,6 +396,8 @@ class BaseModel(ABC):
             self.real_A_with_context = data["A_ref"].to(self.device)
         else:
             self.real_A_with_context = data["A"].to(self.device)
+        if "real_B_prompt" in data:
+            self.real_B_prompt = data["real_B_prompt"]
         self.real_A = self.real_A_with_context.clone()
         if self.opt.data_online_context_pixels > 0:
             self.real_A = self.real_A[
@@ -689,13 +701,26 @@ class BaseModel(ABC):
             self.schedulers = [
                 get_scheduler(optimizer, opt) for optimizer in self.optimizers
             ]
-        if not self.isTrain or opt.train_continue:
+        train_continue_from = getattr(opt, "train_continue_from", "")
+        if not self.isTrain or opt.train_continue or train_continue_from:
             load_suffix = (
                 "iter_%d" % opt.train_load_iter
                 if opt.train_load_iter > 0
                 else opt.train_epoch
             )
-            self.load_networks(load_suffix)
+            load_dir = (
+                os.path.expanduser(train_continue_from)
+                if self.isTrain and train_continue_from
+                else None
+            )
+            if opt.train_finetune:
+                # allow network to not already exists
+                try:
+                    self.load_networks(load_suffix, load_dir=load_dir)
+                except Exception as e:
+                    print(e)
+            else:
+                self.load_networks(load_suffix, load_dir=load_dir)
 
     def parallelize(self, rank):
         for name in self.model_names:
@@ -766,10 +791,18 @@ class BaseModel(ABC):
                     cur_visual[name] = getattr(self, name)
             visual_ret.append(cur_visual)
             if (
-                self.opt.model_type != "cut" and self.opt.model_type != "cycle_gan"
+                self.opt.model_type != "cut"
+                and self.opt.model_type != "cycle_gan"
+                and not self.opt.G_netG == "unet_vid"
+                and not self.opt.G_netG == "vit_vid"
             ):  # GANs have more outputs in practice, including semantics
                 if i == nb_imgs - 1:
                     break
+        if phase == "test" and self.opt.G_netG in ["unet_vid", "vit_vid"]:
+            visual_ret = visual_ret[
+                : self.opt.test_batch_size * (self.opt.data_temporal_number_frames)
+            ]
+
         return visual_ret
 
     def get_display_param(self):
@@ -823,6 +856,17 @@ class BaseModel(ABC):
                     else:
                         torch.save(net.state_dict(), save_path)
 
+                if self.opt.train_G_ema:
+                    net_ema = getattr(self, "net" + name + "_ema", None)
+                    if net_ema is not None:
+                        ema_save_filename = "%s_net_%s_ema.pth" % (epoch, name)
+                        ema_save_path = os.path.join(self.save_dir, ema_save_filename)
+                        if hasattr(net_ema, "module"):
+                            net_ema_to_save = net_ema.module
+                        else:
+                            net_ema_to_save = net_ema
+                        torch.save(net_ema_to_save.state_dict(), ema_save_path)
+
     def export_networks(self, epoch):
         """Export chosen networks weights to the disk.
 
@@ -841,6 +885,9 @@ class BaseModel(ABC):
                 if not self.opt.model_type in [
                     "palette",
                     "cm",
+                    "cm_gan",
+                    "sc",
+                    "b2b",
                 ]:  # Note: export is for generators from GANs only at the moment
                     # For export
                     from util.export import export
@@ -855,6 +902,7 @@ class BaseModel(ABC):
                         and not "ittr" in self.opt.G_netG
                         and not "hdit" in self.opt.G_netG
                         and not "img2img_turbo" in self.opt.G_netG
+                        and not "hat" == self.opt.G_netG
                         and not (
                             torch.__version__[0] == "2"
                             and "segformer" in self.opt.G_netG
@@ -906,44 +954,45 @@ class BaseModel(ABC):
 
         return dummy_input
 
-    def __patch_instance_norm_state_dict(self, state_dict, module, keys, i=0):
-        """Fix InstanceNorm checkpoints incompatibility (prior to 0.4)"""
-        key = keys[i]
-        if i + 1 == len(keys):  # at the end, pointing to a parameter/buffer
-            if module.__class__.__name__.startswith("InstanceNorm") and (
-                key == "running_mean" or key == "running_var"
-            ):
-                if getattr(module, key) is None:
-                    state_dict.pop(".".join(keys))
-            if module.__class__.__name__.startswith("InstanceNorm") and (
-                key == "num_batches_tracked"
-            ):
-                state_dict.pop(".".join(keys))
-        else:
-            self.__patch_instance_norm_state_dict(
-                state_dict, getattr(module, key), keys, i + 1
-            )
-
-    def load_networks(self, epoch):
+    def load_networks(self, epoch, load_dir=None):
         """Load all the networks from the disk.
 
         Parameters:
             epoch (int) -- current epoch; used in the file name '%s_net_%s.pth' % (epoch, name)
+            load_dir (str) -- optional checkpoint directory to load from instead of self.save_dir
         """
+        if load_dir is None:
+            load_dir = self.save_dir
         for name in self.model_names:
             if isinstance(name, str):
                 load_filename = "%s_net_%s.pth" % (epoch, name)
-                load_path = os.path.join(self.save_dir, load_filename)
+                load_path = os.path.join(load_dir, load_filename)
+                ema_load_filename = "%s_net_%s_ema.pth" % (epoch, name)
+                ema_load_path = os.path.join(load_dir, ema_load_filename)
+
+                load_path_effective = load_path
+                if (
+                    not self.opt.isTrain
+                    and getattr(self.opt, "train_G_ema", False)
+                    and os.path.isfile(ema_load_path)
+                ):
+                    load_path_effective = ema_load_path
+
                 net = getattr(self, "net" + name)
                 if isinstance(net, torch.nn.DataParallel):
                     net = net.module
-                if not os.path.isfile(load_path) and "temporal" in load_path:
+                if (
+                    not os.path.isfile(load_path_effective)
+                    and "temporal" in load_path_effective
+                ):
                     print("Skipping missing temporal discriminator pre-trained weights")
                     continue
-                print("loading the model from %s" % load_path)
+                print("loading the model from %s" % load_path_effective)
                 # if you are using PyTorch newer than 0.4 (e.g., built from
                 # GitHub source), you can remove str() on self.device
-                state_dict = torch.load(load_path, map_location=str(self.device))
+                state_dict = torch.load(
+                    load_path_effective, map_location=str(self.device)
+                )
                 if hasattr(state_dict, "_metadata"):
                     del state_dict._metadata
 
@@ -963,35 +1012,179 @@ class BaseModel(ABC):
                             state_dict[new_key] = state_dict[key].clone()
                             del state_dict[key]
 
-                state1 = list(state_dict.keys())
-                state2 = list(net.state_dict().keys())
-                state1.sort()
-                state2.sort()
+                if getattr(self.opt, "alg_diffusion_ddpm_cm_ft", False):
+                    model_dict = net.state_dict()
+                    #                    self._adjust_positional_embeddings(state_dict, model_dict, name)
+                    filtered = {}
 
-                for key1, key2 in zip(state1, state2):
-                    if key1 != key2:
-                        print(key1 == key2, key1, key2)
+                    for k, v in state_dict.items():
+                        if "denoise_fn.model.cond_embed" in k:
+                            new_k = k.replace(
+                                "denoise_fn.model.cond_embed",
+                                "cm_cond_embed.projection",
+                            )
+                        elif k.startswith("cond_embed."):
+                            new_k = k.replace("cond_embed", "cm_cond_embed.projection")
+                        elif "denoise_fn.model." in k:
+                            new_k = k.replace("denoise_fn.model.", "cm_model.")
+                        else:
+                            new_k = k
 
-                for key in list(
-                    state_dict.keys()
-                ):  # need to copy keys here because we mutate in loop
-                    self.__patch_instance_norm_state_dict(
-                        state_dict, net, key.split(".")
+                        if new_k in model_dict and v.shape == model_dict[new_k].shape:
+                            filtered[new_k] = v
+                        else:
+                            if "cond_embed" in k:
+                                print(f"⚠️ unmatched cond_embed key {k} → {new_k}")
+                            else:
+                                print(
+                                    f"⚠️ skipping {new_k}: shape {v.shape if hasattr(v, 'shape') else 'N/A'}"
+                                )
+
+                    missing = set(model_dict.keys()) - set(filtered.keys())
+                    extra = set(state_dict.keys()) - set(model_dict.keys())
+
+                    print(
+                        f"Loaded {len(filtered)}/{len(model_dict)} params; {len(missing)} missing.",
+                        flush=True,
                     )
 
-                if hasattr(state_dict, "g_ema"):
-                    net.load_state_dict(state_dict["g_ema"])
+                    if missing:
+                        print("\n⚠️ Missing keys:")
+                        for k in sorted(missing):
+                            print("   ", k)
+
+                    net.load_state_dict(filtered, strict=False)
+
                 else:
-                    if (
-                        name == "G_A"
-                        and hasattr(net, "unet")
-                        and hasattr(net, "vae")
-                        and any("lora" in n for n, _ in net.unet.named_parameters())
-                    ):
-                        net.load_lora_config(load_path)
-                        print("loading the lora")
+                    model_dict = net.state_dict()
+                    self._adjust_positional_embeddings(state_dict, model_dict, name)
+                    state1 = list(state_dict.keys())
+                    state2 = list(model_dict.keys())
+                    state1.sort()
+                    state2.sort()
+
+                    for key1, key2 in zip(state1, state2):
+                        if key1 != key2:
+                            print(key1 == key2, key1, key2)
+
+                    if isinstance(state_dict, dict) and "_ema" in state_dict:
+                        net.load_state_dict(
+                            state_dict["_ema"], strict=self.opt.model_load_no_strictness
+                        )
                     else:
-                        net.load_state_dict(state_dict)
+                        if (
+                            name == "G_A"
+                            and hasattr(net, "unet")
+                            and hasattr(net, "vae")
+                            and any("lora" in n for n, _ in net.unet.named_parameters())
+                        ):
+                            net.load_lora_config(load_path)
+                            print("loading the lora")
+                        else:
+                            net.load_state_dict(
+                                state_dict, strict=self.opt.model_load_no_strictness
+                            )
+                    model_keys = set(net.state_dict().keys())
+                    ckpt_keys = set(state_dict.keys())
+
+                    matched = model_keys & ckpt_keys
+                    missing = model_keys - ckpt_keys
+                    extra = ckpt_keys - model_keys
+
+                    pct_matched = 100.0 * len(matched) / len(model_keys)
+                    pct_missing = 100.0 * len(missing) / len(model_keys)
+
+                    print(f"\n===== Load report for {name} =====")
+                    print(f"Model params keys: {len(model_keys)}")
+                    print(f"Checkpoint keys:   {len(ckpt_keys)}")
+                    print(f"Matched keys:      {len(matched)} ({pct_matched:.2f}%)")
+                    print(f"Missing keys:      {len(missing)} ({pct_missing:.2f}%)")
+                    print(f"Extra ckpt keys:   {len(extra)}")
+                    print("=================================\n")
+
+    def _adjust_positional_embeddings(self, loaded_state, model_state, net_name):
+        for key in list(loaded_state.keys()):
+            if "pos_embed" not in key:
+                continue
+            if key not in model_state:
+                continue
+            src_tensor = loaded_state[key]
+            tgt_tensor = model_state[key]
+            if not isinstance(src_tensor, torch.Tensor) or not isinstance(
+                tgt_tensor, torch.Tensor
+            ):
+                continue
+            if src_tensor.shape == tgt_tensor.shape:
+                continue
+
+            resized = self._resize_positional_tensor(src_tensor, tgt_tensor)
+            if resized is not None:
+                loaded_state[key] = resized.to(src_tensor.dtype)
+                print(
+                    f"Resized positional embedding {key} from {tuple(src_tensor.shape)} to {tuple(tgt_tensor.shape)} for {net_name}"
+                )
+            else:
+                del loaded_state[key]
+                print(
+                    f"Removed positional embedding {key} due to incompatible shapes {tuple(src_tensor.shape)} vs {tuple(tgt_tensor.shape)} for {net_name}"
+                )
+
+    @staticmethod
+    def _infer_pos_embed_hw(num_tokens, max_extra_tokens=512):
+        for extra in range(max_extra_tokens + 1):
+            spatial_tokens = num_tokens - extra
+            if spatial_tokens <= 0:
+                break
+            side = int(round(math.sqrt(spatial_tokens)))
+            if side * side == spatial_tokens:
+                return side, extra
+        return None, None
+
+    def _resize_positional_tensor(self, source, target):
+        if source.ndim != 3 or target.ndim != 3:
+            return None
+        if source.shape[0] != target.shape[0] or source.shape[-1] != target.shape[-1]:
+            return None
+
+        old_hw, old_extra = self._infer_pos_embed_hw(source.shape[1])
+        new_hw, new_extra = self._infer_pos_embed_hw(target.shape[1])
+
+        if old_hw is None or new_hw is None:
+            return None
+
+        dtype = source.dtype
+        device = source.device
+
+        old_special = source[:, :old_extra] if old_extra else None
+        spatial_tokens = source[:, old_extra:]
+
+        try:
+            spatial_tokens = spatial_tokens.reshape(
+                source.shape[0], old_hw, old_hw, source.shape[-1]
+            )
+        except RuntimeError:
+            return None
+
+        spatial_tokens = spatial_tokens.permute(0, 3, 1, 2).contiguous().float()
+        resized = F.interpolate(
+            spatial_tokens, size=(new_hw, new_hw), mode="bicubic", align_corners=False
+        )
+        resized = resized.to(device=device, dtype=dtype)
+        resized = resized.permute(0, 2, 3, 1).reshape(
+            source.shape[0], new_hw * new_hw, source.shape[-1]
+        )
+
+        if new_extra:
+            target_special = target[:, :new_extra].detach().clone()
+            target_special = target_special.to(device=device, dtype=dtype)
+            if old_special is not None:
+                copy_len = min(old_special.shape[1], target_special.shape[1])
+                target_special[:, :copy_len] = old_special[:, :copy_len].to(
+                    device=device, dtype=dtype
+                )
+            resized = torch.cat([target_special, resized], dim=1)
+
+        return resized
 
     def get_nets(self):
         return_nets = {}
@@ -1467,6 +1660,10 @@ class BaseModel(ABC):
                     metrics_names += [
                         "psnr_test_" + name,
                     ]
+                if "FVD" in self.opt.train_metrics_list:
+                    metrics_names += [
+                        "fvd_test_" + name,
+                    ]
 
                 if "SSIM" in self.opt.train_metrics_list:
                     metrics_names += [
@@ -1477,6 +1674,10 @@ class BaseModel(ABC):
                     metrics_names += [
                         "lpips_test_" + name,
                     ]
+                if "DINOv2" in self.opt.train_metrics_list:
+                    metrics_names += [
+                        "dinov2_test_" + name,
+                    ]
 
             for name in metrics_names:
                 if isinstance(name, str):
@@ -1484,7 +1685,108 @@ class BaseModel(ABC):
                         getattr(self, name)
                     )  # float(...) works for both scalar tensor and float number
 
+            if (
+                hasattr(self, "psnr_step_results")
+                and "PSNR" in self.opt.train_metrics_list
+            ):
+                for test_name in test_names:
+                    per_step_psnr = self.psnr_step_results.get(test_name, {})
+                    for step, value in sorted(per_step_psnr.items()):
+                        metrics[f"psnr_step_{step}_{test_name}"] = float(value)
+
+            if (
+                hasattr(self, "ssim_step_results")
+                and "SSIM" in self.opt.train_metrics_list
+            ):
+                for test_name in test_names:
+                    per_step_ssim = self.ssim_step_results.get(test_name, {})
+                    for step, value in sorted(per_step_ssim.items()):
+                        metrics[f"ssim_step_{step}_{test_name}"] = float(value)
+            if (
+                hasattr(self, "lpips_step_results")
+                and "LPIPS" in self.opt.train_metrics_list
+            ):
+                for test_name in test_names:
+                    per_step_lpips = self.lpips_step_results.get(test_name, {})
+                    for step, value in sorted(per_step_lpips.items()):
+                        metrics[f"lpips_step_{step}_{test_name}"] = float(value)
+            if (
+                hasattr(self, "dinov2_step_results")
+                and "DINOv2" in self.opt.train_metrics_list
+            ):
+                for test_name in test_names:
+                    per_step_dinov2 = self.dinov2_step_results.get(test_name, {})
+                    for step, value in sorted(per_step_dinov2.items()):
+                        metrics[f"dinov2_step_{step}_{test_name}"] = float(value)
+
         return metrics
+
+    def _compute_metrics(self, fake_images, gt_images, filter_psnr_78=False):
+        compute_lpips = hasattr(self, "lpips_metric")
+        compute_dinov2 = hasattr(self, "dinov2_metric")
+        psnr_vals = []
+        ssim_sum, lpips_sum, dinov2_sum, n = 0.0, 0.0, 0.0, 0
+        for fake, gt in zip(fake_images, gt_images):
+            if fake.shape != gt.shape:
+                print(f"Skip mismatched shapes: {fake.shape} vs {gt.shape}")
+                continue
+            fake = (fake.clamp(-1, 1).unsqueeze(0) + 1) / 2
+            gt = (gt.clamp(-1, 1).unsqueeze(0) + 1) / 2
+
+            psnr_vals.append(psnr(fake, gt, data_range=1.0).item())
+            ssim_sum += ssim(fake, gt).item()
+
+            if compute_lpips:
+                min_lpips_size = 64
+                h, w = fake.shape[-2:]
+                if h < min_lpips_size or w < min_lpips_size:
+                    fake_lpips = pad_to_lpips_safe(fake, min_lpips_size)
+                    gt_lpips = pad_to_lpips_safe(gt, min_lpips_size)
+                else:
+                    fake_lpips = fake
+                    gt_lpips = gt
+                lpips_sum += self.lpips_metric(fake_lpips, gt_lpips).item()
+            if compute_dinov2:
+                dinov2_sum += self.dinov2_metric(fake, gt).item()
+            n += 1
+
+        if filter_psnr_78 and psnr_vals:
+            psnr_filtered = [v for v in psnr_vals if v < 78]
+            if psnr_filtered:
+                psnr_val = sum(psnr_filtered) / len(psnr_filtered)
+            else:
+                psnr_val = sum(psnr_vals) / len(psnr_vals)
+        else:
+            psnr_val = sum(psnr_vals) / len(psnr_vals) if psnr_vals else 0.0
+        ssim_val = ssim_sum / n if n else 0.0
+        lpips_val = lpips_sum / n if (n and compute_lpips) else 0.0
+        dinov2_val = dinov2_sum / n if (n and compute_dinov2) else 0.0
+        return psnr_val, ssim_val, lpips_val, dinov2_val
+
+    def _is_b2b_validation_loss_enabled(self):
+        return getattr(self.opt, "model_type", "") == "b2b" and hasattr(
+            self, "compute_b2b_loss"
+        )
+
+    def _compute_current_b2b_validation_loss(self):
+        saved_losses = {
+            name: value
+            for name, value in vars(self).items()
+            if name.startswith("loss_")
+        }
+        try:
+            with torch.no_grad():
+                self.compute_b2b_loss()
+            return float(self.loss_G_tot.detach())
+        finally:
+            current_loss_names = [
+                name for name in vars(self).keys() if name.startswith("loss_")
+            ]
+            for name in current_loss_names:
+                if name not in saved_losses:
+                    delattr(self, name)
+            for name, value in saved_losses.items():
+                setattr(self, name, value)
 
     def compute_metrics_test(
         self, dataloaders_test, n_epoch, n_iter, save_images=False, test_name=""
@@ -1499,6 +1801,11 @@ class BaseModel(ABC):
 
         fake_list = []
         real_list = []
+        fake_list_per_step = {}
+        real_list_per_step = {}
+        compute_b2b_val_loss = self._is_b2b_validation_loss_enabled()
+        b2b_val_loss_sum = 0.0
+        b2b_val_loss_count = 0
 
         if self.opt.train_nb_img_max_fid != MAX_INT:
             progress = tqdm(
@@ -1513,20 +1820,39 @@ class BaseModel(ABC):
             dataloaders_test
         ):  # inner loop (minibatch) within one epoch
             data_test = data_test_list[0]
+            istrain = self.opt.isTrain
+            if compute_b2b_val_loss:
+                self.opt.isTrain = False
+            try:
+                if self.use_temporal:
+                    temporal_data_test = data_test_list[1]
+                    self.set_input_temporal(temporal_data_test)
+                else:
+                    self.set_input(
+                        data_test
+                    )  # unpack data from dataloader and apply preprocessing
 
-            if self.use_temporal:
-                temporal_data_test = data_test_list[1]
-                self.set_input_temporal(temporal_data_test)
-            else:
-                self.set_input(
-                    data_test
-                )  # unpack data from dataloader and apply preprocessing
+                if compute_b2b_val_loss:
+                    cur_batch_size = self.get_current_batch_size()
+                    if self.opt.train_nb_img_max_fid != MAX_INT:
+                        remaining = self.opt.train_nb_img_max_fid - b2b_val_loss_count
+                        cur_weight = min(cur_batch_size, max(remaining, 0))
+                    else:
+                        cur_weight = cur_batch_size
+                    if cur_weight > 0:
+                        b2b_val_loss_sum += (
+                            self._compute_current_b2b_validation_loss() * cur_weight
+                        )
+                        b2b_val_loss_count += cur_weight
+            finally:
+                self.opt.isTrain = istrain
 
             offset = i * self.opt.test_batch_size
-            istrain = self.opt.isTrain
             self.opt.isTrain = False
-            self.inference(self.opt.test_batch_size, offset=offset)
-            self.opt.isTrain = istrain
+            try:
+                self.inference(self.opt.test_batch_size, offset=offset)
+            finally:
+                self.opt.isTrain = istrain
 
             if save_images:
                 pathB = self.save_dir + "/fakeB/%s_epochs_%s_iters_imgs" % (
@@ -1554,20 +1880,67 @@ class BaseModel(ABC):
                 else:
                     batch_real_img = self.real_A
 
+            if (
+                getattr(self.opt, "model_type", "") == "b2b"
+                and hasattr(self, "outputs_per_step")
+                and isinstance(self.outputs_per_step, dict)
+                and len(self.outputs_per_step) > 0
+            ):
+                batch_real_img_per_step = getattr(self, "real_B", batch_real_img)
+
+                for step, step_fake in self.outputs_per_step.items():
+                    fake_list_per_step.setdefault(step, [])
+                    real_list_per_step.setdefault(step, [])
+
+                    max_batch = min(
+                        step_fake.shape[0], batch_real_img_per_step.shape[0]
+                    )
+
+                    if step_fake.ndim == 5 and batch_real_img_per_step.ndim == 5:
+                        max_frames = min(
+                            step_fake.shape[1], batch_real_img_per_step.shape[1]
+                        )
+                        for b in range(max_batch):
+                            for f in range(max_frames):
+                                fake_list_per_step[step].append(
+                                    step_fake[b, f].detach().clone()
+                                )
+                                real_list_per_step[step].append(
+                                    batch_real_img_per_step[b, f].detach().clone()
+                                )
+                    else:
+                        for b in range(max_batch):
+                            fake_list_per_step[step].append(
+                                step_fake[b].detach().clone()
+                            )
+                            real_list_per_step[step].append(
+                                batch_real_img_per_step[b].detach().clone()
+                            )
+
             for i, cur_real in enumerate(batch_real_img):
                 real_list.append(cur_real.unsqueeze(0).clone())
 
             i = 0
             for sub_list in self.visual_names:
-                if i < offset:
+                if self.opt.G_netG in ["unet_vid", "vit_vid"]:
+                    for name in sub_list:
+                        if hasattr(self, name):
+                            setattr(
+                                self, name + "_test_" + test_name, getattr(self, name)
+                            )
+
+                else:
+                    if i < offset:
+                        i += 1
+                        continue
+                    for name in sub_list:
+                        if hasattr(self, name):
+                            setattr(
+                                self, name + "_test_" + test_name, getattr(self, name)
+                            )
                     i += 1
-                    continue
-                for name in sub_list:
-                    if hasattr(self, name):
-                        setattr(self, name + "_test_" + test_name, getattr(self, name))
-                i += 1
-                if i - offset == self.opt.test_batch_size:
-                    break
+                    if i - offset == self.opt.test_batch_size:
+                        break
 
             if progress:
                 progress.n = min(len(fake_list), progress.total)
@@ -1575,6 +1948,22 @@ class BaseModel(ABC):
 
             if len(fake_list) >= self.opt.train_nb_img_max_fid:
                 break
+            if (
+                self.opt.G_netG in ["unet_vid", "vit_vid"]
+                and i < self.opt.test_batch_size
+            ):
+                break
+
+        if compute_b2b_val_loss:
+            if b2b_val_loss_count > 0:
+                setattr(
+                    self,
+                    "G_val_loss_test_" + test_name,
+                    b2b_val_loss_sum / b2b_val_loss_count,
+                )
+            else:
+                setattr(self, "G_val_loss_test_" + test_name, 0.0)
+            setattr(self, "G_val_loss_count_test_" + test_name, b2b_val_loss_count)
 
         fake_list = fake_list[: self.opt.train_nb_img_max_fid]
         real_list = real_list[: self.opt.train_nb_img_max_fid]
@@ -1614,19 +2003,256 @@ class BaseModel(ABC):
             setattr(self, "fidB_test_" + test_name, fidB_test)
             setattr(self, "msidB_test_" + test_name, msidB_test)
             setattr(self, "kidB_test_" + test_name, kidB_test)
-        real_tensor = (torch.cat(real_list) + 1.0) / 2.0
+        real_tensor = (torch.clamp(torch.cat(real_list), min=-1.0, max=1.0) + 1.0) / 2.0
         fake_tensor = (torch.clamp(torch.cat(fake_list), min=-1.0, max=1.0) + 1.0) / 2.0
+        if self.opt.G_netG in ["unet_vid", "vit_vid"]:  # temporal
+            real_tensor, fake_tensor = rearrange_5dto4d_bf(real_tensor, fake_tensor)
+            ssim_test = ssim(real_tensor, fake_tensor)
+            psnr_test = psnr(real_tensor, fake_tensor)
 
-        psnr_test = psnr(real_tensor, fake_tensor)
-        ssim_test = ssim(real_tensor, fake_tensor)
-        setattr(self, "psnr_test_" + test_name, psnr_test)
-        setattr(self, "ssim_test_" + test_name, ssim_test)
+            psnr_each = psnr(real_tensor, fake_tensor, reduction="none")  # [B]
+
+            psnr_list = psnr_each[
+                psnr_each < 78
+            ]  # with this PIQ code, identical images give 80
+            if psnr_list.numel() > 0:
+                psnr_test = psnr_list.mean()
+            else:
+                psnr_test = psnr_each.mean()
+
+            if getattr(self.opt, "alg_palette_metric_mask", False) or getattr(
+                self.opt, "alg_cm_metric_mask", False
+            ):
+                fake_images = [img for seq in self.fake_B_dilated for img in seq]
+                gt_images = [img for seq in self.gt_image_dilated for img in seq]
+                psnr_test, ssim_test, lpips_test, dinov2_test = self._compute_metrics(
+                    fake_images, gt_images
+                )
+                setattr(self, "psnr_test_" + test_name, psnr_test)
+                setattr(self, "ssim_test_" + test_name, ssim_test)
+                setattr(self, "lpips_test_" + test_name, lpips_test)
+                setattr(self, "dinov2_test_" + test_name, dinov2_test)
+
+            elif getattr(self.opt, "alg_sc_metric_mask", False):
+
+                self.psnr_step = {}
+                self.ssim_step = {}
+                self.lpips_step = {}
+                self.dinov2_step = {}
+
+                steps = sorted(self.fake_B_dilated_per_step.keys())
+                for step in steps:
+                    fake_crops = [
+                        img for seq in self.fake_B_dilated_per_step[step] for img in seq
+                    ]
+                    gt_crops = [
+                        img
+                        for seq in self.gt_image_dilated_per_step[step]
+                        for img in seq
+                    ]
+
+                    psnr_val, ssim_val, lpips_val, dinov2_val = self._compute_metrics(
+                        fake_crops, gt_crops
+                    )
+                    self.psnr_step[step] = psnr_val
+                    self.ssim_step[step] = ssim_val
+                    self.lpips_step[step] = lpips_val
+                    self.dinov2_step[step] = dinov2_val
+
+                if not hasattr(self, "psnr_step_results"):
+                    self.psnr_step_results = {}
+                if not hasattr(self, "ssim_step_results"):
+                    self.ssim_step_results = {}
+                if not hasattr(self, "lpips_step_results"):
+                    self.lpips_step_results = {}
+                if not hasattr(self, "dinov2_step_results"):
+                    self.dinov2_step_results = {}
+
+                self.psnr_step_results[test_name] = {
+                    step: float(val) for step, val in self.psnr_step.items()
+                }
+                self.ssim_step_results[test_name] = {
+                    step: float(val) for step, val in self.ssim_step.items()
+                }
+                self.lpips_step_results[test_name] = {
+                    step: float(val) for step, val in self.lpips_step.items()
+                }
+                self.dinov2_step_results[test_name] = {
+                    step: float(val) for step, val in self.dinov2_step.items()
+                }
+                psnr_test = sum(self.psnr_step.values()) / len(self.psnr_step)
+                ssim_test = sum(self.ssim_step.values()) / len(self.ssim_step)
+                lpips_test = sum(self.lpips_step.values()) / len(self.lpips_step)
+                dinov2_test = sum(self.dinov2_step.values()) / len(self.dinov2_step)
+
+                setattr(self, "psnr_test_" + test_name, psnr_test)
+                setattr(self, "ssim_test_" + test_name, ssim_test)
+                setattr(self, "lpips_test_" + test_name, lpips_test)
+                setattr(self, "dinov2_test_" + test_name, dinov2_test)
+
+            else:
+                setattr(self, "psnr_test_" + test_name, psnr_test)
+                setattr(self, "ssim_test_" + test_name, ssim_test)
+
+        else:  # image
+            ssim_test = ssim(real_tensor, fake_tensor)
+            psnr_test = psnr(real_tensor, fake_tensor)
+
+            if getattr(self.opt, "alg_palette_metric_mask", False) or getattr(
+                self.opt, "alg_cm_metric_mask", False
+            ):
+                psnr_test, ssim_test, lpips_test, dinov2_test = self._compute_metrics(
+                    self.fake_B_dilated, self.gt_image_dilated
+                )
+                setattr(self, "psnr_test_" + test_name, psnr_test)
+                setattr(self, "ssim_test_" + test_name, ssim_test)
+                setattr(self, "lpips_test_" + test_name, lpips_test)
+                setattr(self, "dinov2_test_" + test_name, dinov2_test)
+
+            elif getattr(self.opt, "alg_sc_metric_mask", False):
+
+                self.psnr_step = {}
+                self.ssim_step = {}
+                self.lpips_step = {}
+                self.dinov2_step = {}
+                steps = sorted(self.fake_B_dilated_per_step.keys())
+                for step in steps:
+                    fake_crops = self.fake_B_dilated_per_step[step]
+                    gt_crops = self.gt_image_dilated_per_step[step]
+
+                    psnr_val, ssim_val, lpips_val, dinov2_val = self._compute_metrics(
+                        fake_crops, gt_crops
+                    )
+                    self.psnr_step[step] = psnr_val
+                    self.ssim_step[step] = ssim_val
+                    self.lpips_step[step] = lpips_val
+                    self.dinov2_step[step] = dinov2_val
+
+                if not hasattr(self, "psnr_step_results"):
+                    self.psnr_step_results = {}
+                if not hasattr(self, "ssim_step_results"):
+                    self.ssim_step_results = {}
+                if not hasattr(self, "lpips_step_results"):
+                    self.lpips_step_results = {}
+                if not hasattr(self, "dinov2_step_results"):
+                    self.dinov2_step_results = {}
+
+                self.psnr_step_results[test_name] = {
+                    step: float(val) for step, val in self.psnr_step.items()
+                }
+                self.ssim_step_results[test_name] = {
+                    step: float(val) for step, val in self.ssim_step.items()
+                }
+                self.lpips_step_results[test_name] = {
+                    step: float(val) for step, val in self.lpips_step.items()
+                }
+                self.dinov2_step_results[test_name] = {
+                    step: float(val) for step, val in self.dinov2_step.items()
+                }
+
+                # Global average across steps (same logic as palette/cm)
+                psnr_test = sum(self.psnr_step.values()) / len(self.psnr_step)
+                ssim_test = sum(self.ssim_step.values()) / len(self.ssim_step)
+                lpips_test = sum(self.lpips_step.values()) / len(self.lpips_step)
+                dinov2_test = sum(self.dinov2_step.values()) / len(self.dinov2_step)
+                setattr(self, "psnr_test_" + test_name, psnr_test)
+                setattr(self, "ssim_test_" + test_name, ssim_test)
+                setattr(self, "lpips_test_" + test_name, lpips_test)
+                setattr(self, "dinov2_test_" + test_name, dinov2_test)
+
+            else:
+                setattr(self, "psnr_test_" + test_name, psnr_test)
+                setattr(self, "ssim_test_" + test_name, ssim_test)
 
         if "LPIPS" in self.opt.train_metrics_list:
             real_tensor = torch.cat(real_list)
             fake_tensor = torch.clamp(torch.cat(fake_list), min=-1, max=1)
-            lpips_test = self.lpips_metric(real_tensor, fake_tensor).mean()
+            if len(real_tensor.shape) == 5:  # temporal
+                real_tensor, fake_tensor = rearrange_5dto4d_bf(real_tensor, fake_tensor)
+                lpips_test = self.lpips_metric(real_tensor, fake_tensor).mean()
+            elif real_tensor.shape[1] > 3:  # 3+ channels
+                real_tensor_3c = real_tensor[:, :-1, :, :]
+                fake_tensor_3c = fake_tensor[:, :-1, :, :]
+                lpips_test = self.lpips_metric(
+                    real_tensor_3c, fake_tensor_3c
+                ).mean()  ##TODO: per channel and sum
+            else:
+                lpips_test = self.lpips_metric(real_tensor, fake_tensor).mean()
             setattr(self, "lpips_test_" + test_name, lpips_test)
+        if "DINOv2" in self.opt.train_metrics_list:
+            real_tensor = torch.cat(real_list)
+            fake_tensor = torch.clamp(torch.cat(fake_list), min=-1, max=1)
+            if len(real_tensor.shape) == 5:  # temporal
+                real_tensor, fake_tensor = rearrange_5dto4d_bf(real_tensor, fake_tensor)
+            dinov2_test = self.dinov2_metric(real_tensor, fake_tensor)
+            setattr(self, "dinov2_test_" + test_name, dinov2_test)
+
+        if fake_list_per_step:
+            self.psnr_step = {}
+            self.ssim_step = {}
+            self.lpips_step = {}
+            self.dinov2_step = {}
+            filter_psnr_78 = self.opt.G_netG in ["unet_vid", "vit_vid"]
+
+            for step in sorted(fake_list_per_step.keys()):
+                fake_images = fake_list_per_step[step]
+                gt_images = real_list_per_step.get(step, [])
+                if len(fake_images) == 0 or len(gt_images) == 0:
+                    continue
+
+                max_count = min(len(fake_images), len(gt_images))
+                psnr_val, ssim_val, lpips_val, dinov2_val = self._compute_metrics(
+                    fake_images[:max_count],
+                    gt_images[:max_count],
+                    filter_psnr_78=filter_psnr_78,
+                )
+
+                self.psnr_step[step] = psnr_val
+                self.ssim_step[step] = ssim_val
+                self.lpips_step[step] = lpips_val
+                self.dinov2_step[step] = dinov2_val
+
+            if not hasattr(self, "psnr_step_results"):
+                self.psnr_step_results = {}
+            if not hasattr(self, "ssim_step_results"):
+                self.ssim_step_results = {}
+            if not hasattr(self, "lpips_step_results"):
+                self.lpips_step_results = {}
+            if not hasattr(self, "dinov2_step_results"):
+                self.dinov2_step_results = {}
+
+            self.psnr_step_results[test_name] = {
+                step: float(val) for step, val in self.psnr_step.items()
+            }
+            self.ssim_step_results[test_name] = {
+                step: float(val) for step, val in self.ssim_step.items()
+            }
+            self.lpips_step_results[test_name] = {
+                step: float(val) for step, val in self.lpips_step.items()
+            }
+            self.dinov2_step_results[test_name] = {
+                step: float(val) for step, val in self.dinov2_step.items()
+            }
+
+        if "FVD" in self.opt.train_metrics_list:
+            real_tensor = torch.cat(real_list)
+            fake_tensor = torch.clamp(torch.cat(fake_list), min=-1, max=1)
+            combined_tensor = torch.cat((real_tensor, fake_tensor), dim=0)
+            resized_frames = []
+            for b in range(combined_tensor.shape[1]):
+                resized_video = []
+                for t in range(combined_tensor.shape[0]):
+                    frame = combined_tensor[t, b].permute(1, 2, 0).cpu().numpy()
+                    resized_frame = cv2.resize(frame, (224, 224))
+
+                    resized_frame_tensor = torch.tensor(resized_frame).permute(2, 0, 1)
+                    resized_video.append(resized_frame_tensor)
+                resized_frames.append(torch.stack(resized_video))
+            resized_tensor = torch.stack(resized_frames)
+            real_tensor_fvd, fake_tensor_fvd = torch.split(resized_tensor, 2, dim=1)
+            with torch.no_grad():
+                fvd_test = self.fvd_metric.compute(real_tensor_fvd, fake_tensor_fvd)
+            setattr(self, "fvd_test_" + test_name, fvd_test)
 
     def compute_metrics_generic(self, real_act, fake_act):
         # FID

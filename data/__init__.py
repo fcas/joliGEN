@@ -13,6 +13,7 @@ See our template dataset class 'template_dataset.py' for more details.
 
 import importlib
 import glob
+import json
 import torch.utils.data
 from data.base_dataset import BaseDataset
 from torch.utils import data
@@ -28,19 +29,16 @@ def find_dataset_using_name(dataset_name):
     """
     dataset_filename = "data." + dataset_name + "_dataset"
     datasetlib = importlib.import_module(dataset_filename)
-
     dataset = None
     target_dataset_name = dataset_name.replace("_", "") + "dataset"
     for name, cls in datasetlib.__dict__.items():
         if name.lower() == target_dataset_name.lower() and issubclass(cls, BaseDataset):
             dataset = cls
-
     if dataset is None:
         raise NotImplementedError(
             "In %s.py, there should be a subclass of BaseDataset with class name that matches %s in lowercase."
             % (dataset_filename, target_dataset_name)
         )
-
     return dataset
 
 
@@ -64,7 +62,12 @@ def create_dataloader(opt, rank, dataset, batch_size):
 
 
 def create_dataset_temporal(opt, phase):
-    dataset_class = find_dataset_using_name("temporal_labeled_mask_online")
+    if opt.model_type == "palette":
+        dataset_class = find_dataset_using_name(
+            "self_supervised_temporal_labeled_mask_online"
+        )
+    if opt.model_type == "cut":
+        dataset_class = find_dataset_using_name("temporal_labeled_mask_online")
     dataset = dataset_class(opt, phase)
     return dataset
 
@@ -84,6 +87,13 @@ def collate_fn(batch):
 
 
 def list_test_sets(opt):
+    if opt.data_dataset_mode == "multi_dataset":
+        with open(opt.data_multi_dataset_config, "r") as config_file:
+            config = json.load(config_file)
+        test_sets = [test_set["id"] for test_set in config.get("test_sets", [])]
+        print(f"Found multi_dataset test sets: {test_sets}")
+        return test_sets
+
     btoA = opt.data_direction == "BtoA"
     lookup = "B" if btoA else "A"
     test_set_dirs = glob.glob(f"{opt.dataroot}/test" + lookup + "*")
@@ -121,12 +131,17 @@ class CustomDatasetDataLoader:
         else:
             sampler = None
             shuffle = not opt.data_serial_batches
+        persistent_workers = (
+            int(opt.data_num_threads) > 0
+            and getattr(self.dataset, "phase", None) == "train"
+        )
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=batch_size,
             sampler=sampler,
             shuffle=shuffle,
             num_workers=int(opt.data_num_threads),
+            persistent_workers=persistent_workers,
             collate_fn=collate_fn,
         )
 
@@ -162,11 +177,16 @@ class IterableCustomDatasetDataLoader:
             print("dataset [%s] was created" % type(self.dataset).__name__)
         sampler = None
         shuffle = not opt.data_serial_batches
+        persistent_workers = (
+            int(opt.data_num_threads) > 0
+            and getattr(self.dataset, "phase", None) == "train"
+        )
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=batch_size,
             sampler=sampler,
             num_workers=int(opt.data_num_threads),
+            persistent_workers=persistent_workers,
             collate_fn=collate_fn,
         )
 

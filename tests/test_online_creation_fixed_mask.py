@@ -1,0 +1,729 @@
+import numpy as np
+import pytest
+from PIL import Image
+
+import data.online_creation as online_creation
+from data.online_creation import crop_image
+
+
+def _write_sample(tmp_path, bbox_line):
+    img_path = tmp_path / "image.png"
+    bbox_path = tmp_path / "bbox.txt"
+    Image.new("RGB", (256, 256), color=(127, 127, 127)).save(img_path)
+    bbox_path.write_text(bbox_line)
+    return str(img_path), str(bbox_path)
+
+
+def _write_sized_sample(tmp_path, size, bbox_line):
+    img_path = tmp_path / "image.png"
+    bbox_path = tmp_path / "bbox.txt"
+    Image.new("RGB", size, color=(127, 127, 127)).save(img_path)
+    bbox_path.write_text(bbox_line)
+    return str(img_path), str(bbox_path)
+
+
+def _mask_bbox_size(mask):
+    bbox = Image.fromarray(np.array(mask)).getbbox()
+    assert bbox is not None
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _mask_bbox(mask):
+    bbox = Image.fromarray(np.array(mask)).getbbox()
+    assert bbox is not None
+    return bbox
+
+
+def _bbox_contains(outer, inner):
+    return (
+        outer[0] <= inner[0]
+        and outer[1] <= inner[1]
+        and outer[2] >= inner[2]
+        and outer[3] >= inner[3]
+    )
+
+
+def _original_bbox_from_meta(meta, output_side):
+    bbox = meta["processed_bboxes"][0]
+    scale = output_side / float(meta["crop_size"])
+    return (
+        int(round((bbox["original_xmin"] - meta["x_crop"]) * scale)),
+        int(round((bbox["original_ymin"] - meta["y_crop"]) * scale)),
+        int(round((bbox["original_xmax"] - meta["x_crop"]) * scale)),
+        int(round((bbox["original_ymax"] - meta["y_crop"]) * scale)),
+    )
+
+
+def test_crop_image_fixed_model_mask_size_exact_square_with_crop_coordinates(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 96 96 116 116\n")
+
+    crop_coordinates = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        get_crop_coordinates=True,
+        crop_center=True,
+        fixed_mask_size_model=64,
+    )
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_coordinates=crop_coordinates,
+        crop_center=True,
+        fixed_mask_size_model=64,
+    )
+
+    assert _mask_bbox_size(mask) == (64, 64)
+
+
+def test_crop_image_pre_crop_rotation_keeps_shape_and_class_mask(tmp_path):
+    img_path, bbox_path = _write_sized_sample(
+        tmp_path, (256, 256), "1 108 108 148 148\n"
+    )
+
+    img, mask, ref_bbox, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=96,
+        output_dim=96,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        return_meta=True,
+        fixed_mask_min_unmasked_border_model=0,
+        rotation_state={"angle": 30.0},
+    )
+
+    assert img.size == (96, 96)
+    assert mask.size == (96, 96)
+    assert set(np.unique(np.array(mask)).tolist()).issubset({0, 1})
+    assert ref_bbox[0] == 1
+    assert meta["rotation"]["angle"] == 30.0
+
+
+def test_crop_image_pre_crop_rotation_rejects_fill_pixels(tmp_path):
+    img_path, bbox_path = _write_sized_sample(tmp_path, (128, 128), "1 2 2 22 22\n")
+
+    with pytest.raises(ValueError, match="Rotated crop contains fill pixels"):
+        crop_image(
+            img_path,
+            bbox_path,
+            mask_random_offset=[0.0],
+            mask_delta=[[]],
+            crop_delta=0,
+            mask_square=False,
+            crop_dim=64,
+            output_dim=64,
+            context_pixels=0,
+            load_size=[],
+            crop_center=True,
+            fixed_mask_min_unmasked_border_model=0,
+            rotation_state={"angle": 45.0},
+        )
+
+
+def test_crop_image_pre_crop_rotation_shifts_center_to_avoid_fill_pixels(tmp_path):
+    img_path, bbox_path = _write_sized_sample(tmp_path, (256, 256), "1 20 60 44 84\n")
+
+    img, _, _, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=96,
+        output_dim=96,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        return_meta=True,
+        fixed_mask_min_unmasked_border_model=0,
+        rotation_state={"angle": 45.0},
+    )
+
+    bbox = meta["processed_bboxes"][0]
+    x_crop_min = max(0, bbox["xmax"] - meta["crop_size"])
+    x_crop_max = min(
+        bbox["xmin"], meta["rotation"]["rotated_width"] - meta["crop_size"]
+    )
+    y_crop_min = max(0, bbox["ymax"] - meta["crop_size"])
+    y_crop_max = min(
+        bbox["ymin"], meta["rotation"]["rotated_height"] - meta["crop_size"]
+    )
+    assert (meta["x_crop"], meta["y_crop"]) != (
+        (x_crop_min + x_crop_max) // 2,
+        (y_crop_min + y_crop_max) // 2,
+    )
+    assert np.array(img).min() == 127
+
+
+def test_crop_image_pre_crop_rotation_crop_contains_rotated_mask(tmp_path):
+    img_path = tmp_path / "image.png"
+    bbox_path = tmp_path / "bbox.txt"
+    img = np.zeros((256, 256, 3), dtype=np.uint8)
+    img[..., 0] = 30
+    img[60:84, 20:44] = [255, 0, 0]
+    Image.fromarray(img).save(img_path)
+    bbox_path.write_text("1 20 60 44 84\n")
+
+    crop, mask, ref_bbox, _, meta = crop_image(
+        str(img_path),
+        str(bbox_path),
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=96,
+        output_dim=96,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        return_meta=True,
+        fixed_mask_min_unmasked_border_model=0,
+        rotation_state={"angle": 45.0},
+    )
+
+    crop_arr = np.array(crop)
+    mask_arr = np.array(mask)
+    mask_bbox = Image.fromarray(mask_arr).getbbox()
+    bbox = meta["processed_bboxes"][0]
+    assert mask_bbox is not None
+    assert ((crop_arr[..., 0] > 200) & (crop_arr[..., 1] < 50)).sum() > 0
+    assert np.count_nonzero(mask_arr) < (
+        (mask_bbox[2] - mask_bbox[0]) * (mask_bbox[3] - mask_bbox[1])
+    )
+    assert _bbox_contains(
+        (
+            bbox["xmin"] - meta["x_crop"],
+            bbox["ymin"] - meta["y_crop"],
+            bbox["xmax"] - meta["x_crop"],
+            bbox["ymax"] - meta["y_crop"],
+        ),
+        mask_bbox,
+    )
+    assert _bbox_contains(ref_bbox[1:], mask_bbox)
+
+
+def test_crop_image_pre_crop_rotation_reboxes_mask_after_rotation(tmp_path):
+    img_path = tmp_path / "image.png"
+    bbox_path = tmp_path / "bbox.txt"
+    img = np.zeros((256, 256, 3), dtype=np.uint8)
+    img[..., 0] = 30
+    img[60:84, 20:44] = [255, 0, 0]
+    Image.fromarray(img).save(img_path)
+    bbox_path.write_text("1 20 60 44 84\n")
+
+    crop, mask, ref_bbox, _, meta = crop_image(
+        str(img_path),
+        str(bbox_path),
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=96,
+        output_dim=96,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        return_meta=True,
+        fixed_mask_min_unmasked_border_model=0,
+        rotation_state={
+            "angle": 45.0,
+            "rebox_mask_after_rotation": True,
+        },
+    )
+
+    crop_arr = np.array(crop)
+    mask_arr = np.array(mask)
+    mask_bbox = Image.fromarray(mask_arr).getbbox()
+    assert mask_bbox is not None
+    assert ((crop_arr[..., 0] > 200) & (crop_arr[..., 1] < 50)).sum() > 0
+    assert np.count_nonzero(mask_arr) == (
+        (mask_bbox[2] - mask_bbox[0]) * (mask_bbox[3] - mask_bbox[1])
+    )
+    assert tuple(ref_bbox[1:]) == mask_bbox
+    assert meta["rotation"]["rebox_mask_after_rotation"] is True
+    bbox = meta["processed_bboxes"][0]
+    assert (
+        bbox["original_xmin"],
+        bbox["original_ymin"],
+        bbox["original_xmax"],
+        bbox["original_ymax"],
+    ) == (bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"])
+
+
+def test_crop_image_keep_ratio_load_size_scales_crop_without_distortion(tmp_path):
+    img_path, bbox_path = _write_sized_sample(tmp_path, (200, 100), "1 50 25 90 65\n")
+    load_size = [100, 100]
+
+    crop_coordinates = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=100,
+        output_dim=100,
+        context_pixels=0,
+        load_size=load_size,
+        load_size_keep_ratio=True,
+        get_crop_coordinates=True,
+        crop_center=True,
+    )
+    _, _, _, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=100,
+        output_dim=100,
+        context_pixels=0,
+        load_size=load_size,
+        load_size_keep_ratio=True,
+        crop_coordinates=crop_coordinates,
+        crop_center=True,
+        return_meta=True,
+    )
+
+    assert load_size == [100, 100]
+    assert meta["loaded_width"] == 100
+    assert meta["loaded_height"] == 50
+    assert meta["crop_size"] == 50
+
+
+def test_crop_image_keep_ratio_load_size_uses_largest_side_for_portrait(tmp_path):
+    img_path, bbox_path = _write_sized_sample(
+        tmp_path, (1080, 1920), "1 400 700 700 1200\n"
+    )
+
+    _, _, _, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=512,
+        output_dim=512,
+        context_pixels=0,
+        load_size=[1920, 1080],
+        load_size_keep_ratio=True,
+        crop_center=True,
+        return_meta=True,
+    )
+
+    assert meta["loaded_width"] == 1080
+    assert meta["loaded_height"] == 1920
+
+
+def test_crop_image_fixed_model_mask_size_keeps_larger_containing_square(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 64 80 164 120\n")
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=True,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_size_model=64,
+    )
+
+    assert _mask_bbox_size(mask) == (100, 100)
+
+
+def test_crop_image_fixed_model_mask_size_leaves_default_unmasked_border(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 48 48 80 80\n")
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_size_model=128,
+    )
+
+    assert _mask_bbox(mask) == (4, 4, 124, 124)
+
+
+def test_crop_image_fixed_model_mask_size_shifts_edge_mask_inside_border(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 0 0 20 20\n")
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_size_model=128,
+        fixed_mask_min_unmasked_border_model=4,
+    )
+
+    assert _mask_bbox(mask) == (4, 4, 124, 124)
+
+
+def test_crop_image_fixed_model_mask_size_clamps_large_bbox_to_border(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 0 0 256 256\n")
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=True,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_size_model=64,
+        fixed_mask_min_unmasked_border_model=4,
+    )
+
+    assert _mask_bbox(mask) == (4, 4, 124, 124)
+
+
+def test_crop_image_square_random_offset_respects_min_unmasked_border(
+    tmp_path, monkeypatch
+):
+    img_path, bbox_path = _write_sample(tmp_path, "1 48 48 80 80\n")
+    monkeypatch.setattr(online_creation.random, "randint", lambda _low, high: high)
+
+    _, mask, _, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[4.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=True,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_min_unmasked_border_model=16,
+        return_meta=True,
+    )
+
+    mask_bbox = _mask_bbox(mask)
+    assert mask_bbox == (16, 16, 112, 112)
+    assert _bbox_contains(mask_bbox, _original_bbox_from_meta(meta, 128))
+
+
+def test_crop_image_square_border_enlarges_crop_to_keep_original_bbox(
+    tmp_path,
+):
+    img_path, bbox_path = _write_sample(tmp_path, "1 40 40 140 140\n")
+
+    _, mask, ref_bbox, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=True,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_min_unmasked_border_model=16,
+        return_meta=True,
+    )
+
+    mask_bbox = _mask_bbox(mask)
+    assert meta["crop_size"] == 134
+    assert mask_bbox[0] >= 16
+    assert mask_bbox[1] >= 16
+    assert mask_bbox[2] <= 112
+    assert mask_bbox[3] <= 112
+    assert _bbox_contains(mask_bbox, _original_bbox_from_meta(meta, 128))
+
+
+def test_crop_image_square_border_pads_edge_bbox_instead_of_rejecting(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 0 0 32 32\n")
+
+    _, mask, _, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=True,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_min_unmasked_border_model=16,
+        return_meta=True,
+    )
+
+    mask_bbox = _mask_bbox(mask)
+    assert mask_bbox[0] >= 16
+    assert mask_bbox[1] >= 16
+    assert mask_bbox[2] <= 112
+    assert mask_bbox[3] <= 112
+    assert meta["x_padding"] > 0
+    assert meta["y_padding"] > 0
+    assert _bbox_contains(mask_bbox, _original_bbox_from_meta(meta, 128))
+
+
+def test_crop_image_non_square_border_enlarges_crop(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 40 50 140 90\n")
+
+    _, mask, _, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=100,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_min_unmasked_border_model=16,
+        return_meta=True,
+    )
+
+    mask_bbox = _mask_bbox(mask)
+    assert meta["crop_size"] == 134
+    assert mask_bbox[0] >= 16
+    assert mask_bbox[1] >= 16
+    assert mask_bbox[2] <= 112
+    assert mask_bbox[3] <= 112
+
+
+def test_crop_image_non_square_border_pads_edge_bbox(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 0 0 60 40\n")
+
+    _, mask, _, _, meta = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=80,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        fixed_mask_min_unmasked_border_model=16,
+        return_meta=True,
+    )
+
+    mask_bbox = _mask_bbox(mask)
+    assert mask_bbox[0] >= 16
+    assert mask_bbox[1] >= 16
+    assert mask_bbox[2] <= 112
+    assert mask_bbox[3] <= 112
+    assert meta["x_padding"] > 0
+    assert meta["y_padding"] > 0
+
+
+def test_crop_image_broaden_rect_aug_disabled_is_noop(tmp_path):
+    img_path, bbox_path = _write_sample(tmp_path, "1 96 96 116 116\n")
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        broaden_rect_aug=False,
+    )
+
+    assert _mask_bbox_size(mask) == (20, 20)
+
+
+def test_crop_image_broaden_rect_aug_side_expand_contains_original(
+    tmp_path, monkeypatch
+):
+    img_path, bbox_path = _write_sample(tmp_path, "1 96 96 116 116\n")
+    monkeypatch.setattr(online_creation.random, "random", lambda: 0.30)
+    monkeypatch.setattr(online_creation.random, "uniform", lambda _low, _high: 0.50)
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        broaden_rect_aug=True,
+    )
+
+    assert _mask_bbox_size(mask) == (40, 40)
+
+
+def test_crop_image_broaden_rect_aug_target_area(tmp_path, monkeypatch):
+    img_path, bbox_path = _write_sample(tmp_path, "1 96 96 116 116\n")
+    monkeypatch.setattr(online_creation.random, "random", lambda: 0.60)
+    monkeypatch.setattr(online_creation.random, "uniform", lambda _low, _high: 4.0)
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        broaden_rect_aug=True,
+    )
+
+    assert _mask_bbox_size(mask) == (40, 40)
+
+
+def test_crop_image_broaden_rect_aug_target_aspect(tmp_path, monkeypatch):
+    img_path, bbox_path = _write_sample(tmp_path, "1 96 96 116 116\n")
+    monkeypatch.setattr(online_creation.random, "random", lambda: 0.80)
+    monkeypatch.setattr(online_creation.random, "uniform", lambda _low, _high: 2.0)
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        broaden_rect_aug=True,
+    )
+
+    assert _mask_bbox_size(mask) == (40, 20)
+
+
+def test_crop_image_broaden_rect_aug_high_roll_uses_bounded_aspect(
+    tmp_path, monkeypatch
+):
+    img_path, bbox_path = _write_sample(tmp_path, "1 32 96 52 116\n")
+    monkeypatch.setattr(online_creation.random, "random", lambda: 0.95)
+    monkeypatch.setattr(online_creation.random, "uniform", lambda _low, _high: 2.85)
+
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_center=True,
+        broaden_rect_aug=True,
+    )
+
+    width, height = _mask_bbox_size(mask)
+    assert width > 20
+    assert height == 20
+    assert width < 128
+
+
+def test_crop_image_broaden_rect_aug_reuses_crop_coordinate_state(
+    tmp_path, monkeypatch
+):
+    img_path, bbox_path = _write_sample(tmp_path, "1 96 96 116 116\n")
+    monkeypatch.setattr(online_creation.random, "random", lambda: 0.30)
+    monkeypatch.setattr(online_creation.random, "uniform", lambda _low, _high: 0.50)
+
+    crop_coordinates = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        get_crop_coordinates=True,
+        crop_center=True,
+        broaden_rect_aug=True,
+    )
+
+    monkeypatch.setattr(online_creation.random, "random", lambda: 0.0)
+    _, mask, _, _ = crop_image(
+        img_path,
+        bbox_path,
+        mask_random_offset=[0.0],
+        mask_delta=[[]],
+        crop_delta=0,
+        mask_square=False,
+        crop_dim=128,
+        output_dim=128,
+        context_pixels=0,
+        load_size=[],
+        crop_coordinates=crop_coordinates,
+        crop_center=True,
+        broaden_rect_aug=True,
+    )
+
+    assert _mask_bbox_size(mask) == (40, 40)

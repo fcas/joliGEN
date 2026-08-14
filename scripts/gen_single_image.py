@@ -11,10 +11,15 @@ from options.inference_gan_options import InferenceGANOptions
 import cv2
 import numpy as np
 import torch
+import torchvision
 from models import gan_networks
 from options.train_options import TrainOptions
 from torchvision import transforms
 from torchvision.utils import save_image
+
+from PIL import Image
+import tifffile
+from util.util import rgbn_float_img_to_8bits_display
 
 
 def get_z_random(batch_size=1, nz=8, random_type="gauss"):
@@ -78,7 +83,6 @@ def inference_logger(name):
 
 
 def inference(args):
-
     PROGRESS_NUM_STEPS = 6
     logger = inference_logger(args.name)
     logger.info(f"[1/%i] launch inference" % PROGRESS_NUM_STEPS)
@@ -93,18 +97,38 @@ def inference(args):
     # reading image
     img_width = args.img_width if args.img_width is not None else opt.data_crop_size
     img_height = args.img_height if args.img_height is not None else opt.data_crop_size
-    img = cv2.imread(args.img_in)
+    if opt.data_image_bits > 8 and opt.model_input_nc == 1:
+        img = Image.open(args.img_in)
+        # if img_height != opt.data_crop_size or img_width != opt.data_crop_size:
+        #    print(
+        #        "Requested image size differs from training crop size, resizing is not supported for images with more than 8 bits per channel"
+        #    )
+        #    exit(1)
+    elif opt.data_image_bits > 8 and opt.model_input_nc > 1:
+        img = tifffile.imread(args.img_in)
+    else:
+        img = cv2.imread(args.img_in)
     original_img = img.copy()
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (img_width, img_height), interpolation=cv2.INTER_CUBIC)
+    if opt.data_image_bits == 8 and opt.model_input_nc != 1:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (img_width, img_height), interpolation=cv2.INTER_CUBIC)
 
     logger.info(f"[3/%i] image loaded" % PROGRESS_NUM_STEPS)
 
     # preprocessing
-    tranlist = [
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ]
+    if opt.data_image_bits > 8:
+        tranlist = [transforms.ToTensor()]
+        tranlist += [torchvision.transforms.v2.ToDtype(torch.float32)]
+        bit_scaling = 2**opt.data_image_bits - 1
+        tranlist += [transforms.Lambda(lambda img: img * (1 / float(bit_scaling)))]
+        tranlist += [
+            transforms.Normalize((0.5,), (0.5,))
+        ]  # XXX: > 8bit, mono canal only for now
+    else:
+        tranlist = [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
     tran = transforms.Compose(tranlist)
     img_tensor = tran(img)
     if not args.cpu:
@@ -127,19 +151,35 @@ def inference(args):
     logger.info(f"[4/%i] preprocessing finished" % PROGRESS_NUM_STEPS)
 
     # run through model
-    out_tensor = model(img_tensor)[0].detach()
+    if opt.G_netG == "img2img_turbo":
+        out_tensor = model(img_tensor, args.prompt)[0].detach()
+    else:
+        out_tensor = model(img_tensor)[0].detach()
 
     logger.info(f"[5/%i] out tensor available" % PROGRESS_NUM_STEPS)
 
     # post-processing
     out_img = out_tensor.data.cpu().float().numpy()
     print(out_img.shape)
-    out_img = (np.transpose(out_img, (1, 2, 0)) + 1) / 2.0 * 255.0
+
     # print(out_img)
-    out_img = cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR)
+    if opt.data_image_bits > 8 and opt.model_input_nc > 1:
+        out_img = np.transpose(out_img, (1, 2, 0)) + 1
+        rgb_img, nrg_img = rgbn_float_img_to_8bits_display(out_img, gamma=0.7)
+        rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+        nrg_img = cv2.cvtColor(nrg_img, cv2.COLOR_RGB2BGR)
+        out_img = np.concatenate((rgb_img, nrg_img), axis=1)
+    else:
+        out_img = (np.transpose(out_img, (1, 2, 0)) + 1) / 2.0 * 255.0
+        out_img = cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR)
 
     if args.compare:
-        out_img = np.concatenate((original_img, out_img), axis=1)
+        original_img_cv = np.array(original_img)
+        np.multiply(original_img_cv, 255.0 / 4096.0, original_img_cv, casting="unsafe")
+        original_img_cv = cv2.cvtColor(original_img_cv, cv2.COLOR_RGB2BGR)
+        print("original image size=", original_img_cv.shape)
+        print("generated image size=", out_img.shape)
+        out_img = np.concatenate((original_img_cv, out_img), axis=1)
 
     cv2.imwrite(args.img_out, out_img)
 

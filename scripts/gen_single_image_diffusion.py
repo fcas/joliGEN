@@ -15,9 +15,12 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 from PIL import Image
+import torchvision
 from torchvision import transforms
 from torchvision.utils import save_image
 from tqdm import tqdm
+
+from PIL import Image
 
 jg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../")
 sys.path.append(jg_dir)
@@ -58,7 +61,7 @@ def load_model(
     train_json_path = model_in_dir + "/train_config.json"
     with open(train_json_path, "r") as jsonf:
         train_json = json.load(jsonf)
-
+    train_json["gpu_ids"] = str(device.index)
     opt = TrainOptions().parse_json(train_json)
     opt.jg_dir = jg_dir
 
@@ -75,16 +78,21 @@ def load_model(
         opt.data_online_creation_mask_random_offset_A = [0.0]
 
     opt.model_prior_321_backwardcompatibility = model_prior_321_backwardcompatibility
-    if opt.model_type == "cm":
+    if opt.model_type in ["cm", "cm_gan", "sc", "b2b"]:
         opt.alg_palette_sampling_method = sampling_method
         opt.alg_diffusion_cond_embed_dim = 256
-    model = diffusion_networks.define_G(**vars(opt))
+    model = diffusion_networks.define_G(opt=opt, **vars(opt))
     model.eval()
 
     # handle old models
-    weights = torch.load(
-        os.path.join(model_in_dir, model_in_filename), map_location=torch.device(device)
-    )
+    weights_path = os.path.join(model_in_dir, model_in_filename)
+    if opt.model_type == "b2b" and weights_path.endswith(".pth"):
+        ema_weights_path = weights_path[:-4] + "_ema.pth"
+        if os.path.isfile(ema_weights_path):
+            weights_path = ema_weights_path
+    weights = torch.load(weights_path, map_location=torch.device(device))
+    if isinstance(weights, dict) and "_ema" in weights:
+        weights = weights["_ema"]
     if opt.model_prior_321_backwardcompatibility:
         weights = {
             k.replace("denoise_fn.cond_embed", "cond_embed"): v
@@ -109,6 +117,9 @@ def load_model(
 
     if opt.model_type == "palette":
         model.set_new_sampling_method(sampling_method)
+
+    if opt.alg_diffusion_task == "pix2pix":
+        opt.alg_diffusion_cond_image_creation = "pix2pix"
 
     model = model.to(device)
     return model, opt
@@ -189,6 +200,8 @@ def generate(
     cls,
     alg_diffusion_super_resolution_downsample,
     alg_diffusion_guidance_scale,
+    alg_sc_denoise_inferstep,
+    alg_b2b_denoise_timesteps,
     data_refined_mask,
     min_crop_bbox_ratio,
     alg_palette_ddim_num_steps,
@@ -241,9 +254,15 @@ def generate(
     # Load image
 
     # reading image
-    img = cv2.imread(img_in)
-    img_orig = img.copy()
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if opt.data_image_bits > 8:
+        img = Image.open(img_in)  # we use PIL
+        img_orig = img.copy()
+        local_img_width, local_img_height = img.size
+    else:
+        img = cv2.imread(img_in)
+        img_orig = img.copy()
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        local_img_width, local_img_height = img.shape[:2]
 
     # reading the mask
     mask = None
@@ -315,6 +334,12 @@ def generate(
             crop_center=True,
             bbox_ref_id=bbox_idx,
             min_crop_bbox_ratio=min_crop_bbox_ratio,
+            fixed_mask_size_model=getattr(
+                opt, "data_online_creation_mask_fixed_size_A", -1
+            ),
+            fixed_mask_min_unmasked_border_model=getattr(
+                opt, "data_online_creation_mask_min_unmasked_border_A", 4
+            ),
         )
 
         img, mask, ref_bbox, bbox_ref_id = crop_image(
@@ -332,6 +357,12 @@ def generate(
             crop_center=True,
             bbox_ref_id=bbox_idx,
             override_class=cls,
+            fixed_mask_size_model=getattr(
+                opt, "data_online_creation_mask_fixed_size_A", -1
+            ),
+            fixed_mask_min_unmasked_border_model=getattr(
+                opt, "data_online_creation_mask_min_unmasked_border_A", 4
+            ),
         )
 
         x_crop, y_crop, crop_size = crop_coordinates
@@ -379,14 +410,26 @@ def generate(
         bbox_select[3] += opt.data_online_context_pixels
         bbox_select[2] += opt.data_online_context_pixels
 
+        # clamp bbox to image size
+        bbox_select[0] = max(0, bbox_select[0])
+        bbox_select[1] = max(0, bbox_select[1])
+        bbox_select[2] = min(img_orig.shape[1], bbox_select[2])
+        bbox_select[3] = min(img_orig.shape[0], bbox_select[3])
+
         img, mask = np.array(img), np.array(mask)
 
     if img_width > 0 and img_height > 0:
-        img = cv2.resize(img, (img_width, img_height))
-        if mask is not None:
-            mask = cv2.resize(mask, (img_width, img_height))
-        if ref is not None:
-            ref = cv2.resize(ref, (img_width, img_height))
+        if img_height != local_img_height or img_width != local_img_width:
+            if opt.data_image_bits > 8:
+                print(
+                    "Requested image size differs from training crop size, resizing is not supported for images with more than 8 bits per channel"
+                )
+                exit(1)
+            img = cv2.resize(img, (img_width, img_height))
+            if mask is not None:
+                mask = cv2.resize(mask, (img_width, img_height))
+            if ref is not None:
+                ref = cv2.resize(ref, (img_width, img_height))
 
     if logger:
         logger.info(
@@ -449,18 +492,24 @@ def generate(
             # round & flatten
             generated_bbox = list(map(round, generated_bbox[0] + generated_bbox[1]))
 
-        # add 1 pixel margin for sketches
-        cond = cv2.resize(cond, (bbox_w - 2, bbox_h - 2), interpolation=cv2.INTER_CUBIC)
-        cond = np.pad(cond, [(1, 1), (1, 1), (0, 0)])
+        cond = cv2.resize(cond, (bbox_w, bbox_h), interpolation=cv2.INTER_CUBIC)
         img[y0:y1, x0:x1] = cond
 
     # preprocessing to torch
     totensor = transforms.ToTensor()
-    tranlist = [
-        totensor,
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        #    resize,
-    ]
+    if opt.data_image_bits > 8:
+        tranlist = [totensor, torchvision.transforms.v2.ToDtype(torch.float32)]
+        bit_scaling = 2**opt.data_image_bits - 1
+        tranlist += [transforms.Lambda(lambda img: img * (1 / float(bit_scaling)))]
+        tranlist += [
+            transforms.Normalize((0.5,), (0.5,))
+        ]  # XXX: > 8bit, mono canal only for now
+    else:
+        tranlist = [
+            totensor,
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            #    resize,
+        ]
 
     tran = transforms.Compose(tranlist)
     img_tensor = tran(img).clone().detach()
@@ -532,6 +581,8 @@ def generate(
     elif opt.alg_diffusion_cond_image_creation == "y_t":
         if opt.model_type == "palette":
             cond_image = y_t.unsqueeze(0)
+        elif opt.model_type == "b2b" and opt.alg_b2b_mask_as_channel:
+            cond_image = mask.to(device).unsqueeze(0)
         else:
             cond_image = None
     elif opt.alg_diffusion_cond_image_creation == "sketch":
@@ -539,21 +590,27 @@ def generate(
     elif opt.alg_diffusion_cond_image_creation == "canny":
         clamp = torch.clamp(mask, 0, 1)
         if cond_in:
-            # mask the background to avoid canny edges around cond image
-            img_tensor_canny = clamp * img_tensor + clamp - 1
+            # apply canny to the bbox to avoid edges around cond image
+            img_tensor_canny = img_tensor[:, y0:y1, x0:x1]
+            mask_canny = mask[:, y0:y1, x0:x1]
         else:
             img_tensor_canny = img_tensor
-        cond_image = fill_img_with_canny(
+            mask_canny = mask
+        canny = fill_img_with_canny(
             img_tensor_canny.unsqueeze(0),
-            mask.unsqueeze(0),
+            mask_canny.unsqueeze(0),
             low_threshold=alg_diffusion_sketch_canny_thresholds[0],
             high_threshold=alg_diffusion_sketch_canny_thresholds[1],
             low_threshold_random=-1,
             high_threshold_random=-1,
+            select_canny=[1],
         )
         if cond_in:
             # restore background
-            cond_image = cond_image * clamp + img_tensor * (1 - clamp)
+            cond_image = img_tensor.unsqueeze(0).clone()
+            cond_image[:, :, y0:y1, x0:x1] = canny
+        else:
+            cond_image = canny
     elif opt.alg_diffusion_cond_image_creation == "sam":
         opt.f_s_weight_sam = "../" + opt.f_s_weight_sam
         if not os.path.exists(opt.f_s_weight_sam):
@@ -582,10 +639,15 @@ def generate(
         cond_image = transform_hr(cond_image).detach()
     elif opt.alg_diffusion_cond_image_creation == "pix2pix":
         # use same interpolation as get_transform
-        transform_hr = T.Resize(
-            (img_height, img_width), interpolation=T.InterpolationMode.BICUBIC
-        )
-        cond_image = transform_hr(img_tensor.unsqueeze(0)).detach()
+        if (img_height > 0 and img_height != opt.data_crop_size) or (
+            img_width > 0 and img_width != opt.data_crop_size
+        ):
+            transform_hr = T.Resize(
+                (img_height, img_width), interpolation=T.InterpolationMode.BICUBIC
+            )
+            cond_image = transform_hr(img_tensor.unsqueeze(0)).detach()
+        else:
+            cond_image = img_tensor.unsqueeze(0).detach()
 
     if mask is None:
         cl_mask = None
@@ -599,7 +661,9 @@ def generate(
         cl_mask,
     )
     if mask == None:
-        img_tensor = None
+        y0_tensor = None
+    else:
+        y0_tensor = img_tensor
 
     if opt.model_type == "palette":
         if "class" in model.denoise_fn.conditioning:
@@ -617,7 +681,7 @@ def generate(
             out_tensor, visu = model.restoration(
                 y_cond=cond_image,
                 y_t=y_t,
-                y_0=img_tensor,
+                y_0=y0_tensor,
                 mask=mask,
                 cls=cls_tensor,
                 ref=ref_tensor,
@@ -626,9 +690,39 @@ def generate(
                 ddim_num_steps=alg_palette_ddim_num_steps,
                 ddim_eta=alg_palette_ddim_eta,
             )
-        elif opt.model_type == "cm":
+        elif opt.model_type == "cm" or opt.model_type == "cm_gan":
             sampling_sigmas = (80.0, 24.4, 5.84, 0.9, 0.661)
+
             out_tensor = model.restoration(y_t, cond_image, sampling_sigmas, mask)
+
+        elif opt.model_type == "sc":
+            print(" sc restoration ", alg_sc_denoise_inferstep)
+            out_tensor = model.restoration(
+                y_t, cond_image, alg_sc_denoise_inferstep, mask
+            )
+
+        elif opt.model_type == "b2b":
+            B = y_t.size(0)
+            label_id = 0 if int(cls) < 0 else int(cls)
+            labels = torch.ones(B, device=y_t.device, dtype=torch.long) * label_id
+            precision_mode = torch.full(
+                (B,), 2 if bbox_in else 0, device=y_t.device, dtype=torch.long
+            )
+            precision_severity = torch.full(
+                (B,), 1.0 if bbox_in else 0.0, device=y_t.device
+            )
+            out_tensor = model.restoration(
+                y_t,
+                cond_image,
+                alg_b2b_denoise_timesteps,
+                mask,
+                labels,
+                source_image=img_tensor,
+                mask_precision_mode=precision_mode,
+                mask_precision_severity=precision_severity,
+            )
+
+        # XXX: !=8bit images are converted to 8bit RGB for now
         out_img = to_np(
             out_tensor
         )  # out_img = out_img.detach().data.cpu().float().numpy()[0]
@@ -668,29 +762,42 @@ def generate(
         cond_img = to_np(cond_image)
 
     if write:
-        cv2.imwrite(os.path.join(dir_out, name + "_orig.png"), img_orig)
-        if cond_image is not None:
-            cv2.imwrite(os.path.join(dir_out, name + "_cond.png"), cond_img)
-        cv2.imwrite(os.path.join(dir_out, name + "_generated.png"), out_img_real_size)
-        cv2.imwrite(os.path.join(dir_out, name + "_y_t.png"), to_np(y_t))
-        if mask is not None:
-            cv2.imwrite(os.path.join(dir_out, name + "_y_0.png"), to_np(img_tensor))
-            cv2.imwrite(os.path.join(dir_out, name + "_generated_crop.png"), out_img)
-            cv2.imwrite(os.path.join(dir_out, name + "_mask.png"), to_np(mask))
-        if ref is not None:
-            cv2.imwrite(os.path.join(dir_out, name + "_ref_orig.png"), ref_orig)
-        if cond_in:
-            # crop before cond image
-            orig_crop = img_orig[
-                bbox_select[1] : bbox_select[3], bbox_select[0] : bbox_select[2]
-            ]
-            cv2.imwrite(os.path.join(dir_out, name + "_orig_crop.png"), orig_crop)
-        if bbox_in:
-            with open(os.path.join(dir_out, name + "_orig_bbox.json"), "w") as out:
-                out.write(json.dumps(bbox))
-        if generated_bbox:
-            with open(os.path.join(dir_out, name + "_generated_bbox.json"), "w") as out:
-                out.write(json.dumps(generated_bbox))
+        if opt.data_image_bits > 8:
+            img_np = to_np(img_tensor)  # comes from PIL
+            cv2.imwrite(os.path.join(dir_out, name + "_orig.png"), img_np)
+            if cond_image is not None:
+                cv2.imwrite(os.path.join(dir_out, name + "_cond.png"), cond_img)
+            cv2.imwrite(os.path.join(dir_out, name + "_generated.png"), out_img_resized)
+        else:
+            cv2.imwrite(os.path.join(dir_out, name + "_orig.png"), img_orig)
+            if cond_image is not None:
+                cv2.imwrite(os.path.join(dir_out, name + "_cond.png"), cond_img)
+            cv2.imwrite(
+                os.path.join(dir_out, name + "_generated.png"), out_img_real_size
+            )
+            cv2.imwrite(os.path.join(dir_out, name + "_y_t.png"), to_np(y_t))
+            if mask is not None:
+                cv2.imwrite(os.path.join(dir_out, name + "_y_0.png"), to_np(img_tensor))
+                cv2.imwrite(
+                    os.path.join(dir_out, name + "_generated_crop.png"), out_img
+                )
+                cv2.imwrite(os.path.join(dir_out, name + "_mask.png"), to_np(mask))
+            if ref is not None:
+                cv2.imwrite(os.path.join(dir_out, name + "_ref_orig.png"), ref_orig)
+            if cond_in:
+                # crop before cond image
+                orig_crop = img_orig[
+                    bbox_select[1] : bbox_select[3], bbox_select[0] : bbox_select[2]
+                ]
+                cv2.imwrite(os.path.join(dir_out, name + "_orig_crop.png"), orig_crop)
+            if bbox_in:
+                with open(os.path.join(dir_out, name + "_orig_bbox.json"), "w") as out:
+                    out.write(json.dumps(bbox))
+            if generated_bbox:
+                with open(
+                    os.path.join(dir_out, name + "_generated_bbox.json"), "w"
+                ) as out:
+                    out.write(json.dumps(generated_bbox))
 
         print("Successfully generated image ", name)
 
